@@ -1,4 +1,3 @@
-```markdown
 # Tailscale Exit Node для OpenWrt
 
 Однострочный скрипт для автоматической установки и настройки Tailscale на OpenWrt 25.12 (с пакетным менеджером `apk`) в режиме **Exit Node**.  
