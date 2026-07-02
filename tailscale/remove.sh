@@ -5,9 +5,11 @@ set -e
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 [ "$(id -u)" != "0" ] && error "Запускайте от root"
@@ -51,3 +53,22 @@ info "Удаляем init-скрипт Tailscale..."
 rm -f /etc/init.d/tailscale
 
 info "Чистка завершена. Tailscale удалён."
+
+# Предложение перезагрузить роутер
+if [ -t 0 ] && [ -t 1 ]; then
+    echo ""
+    echo "Для полной очистки рекомендуется перезагрузить роутер."
+    printf "Перезагрузить сейчас? (y/N): "
+    read -r answer
+    case "$answer" in
+        [yY]|[yY][eE][sS])
+            info "Перезагрузка..."
+            reboot
+            ;;
+        *)
+            info "Перезагрузка отменена. Вы можете перезагрузить позже командой 'reboot'."
+            ;;
+    esac
+else
+    info "Неинтерактивный режим. Рекомендуется перезагрузить роутер вручную командой 'reboot'."
+fi
