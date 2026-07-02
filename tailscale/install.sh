@@ -1,6 +1,6 @@
 #!/bin/sh
-# Установка Tailscale + Exit Node + автозапуск для OpenWrt 25.12 (apk)
-# Интерактивный выбор локальной подсети из списка интерфейсов
+# Установка/перенастройка Tailscale + Exit Node для OpenWrt 25.12 (apk)
+# Интерактивный выбор локальной подсети
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -12,9 +12,7 @@ warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # Проверка прав
-if [ "$(id -u)" != "0" ]; then
-    error "Запускайте от root"
-fi
+[ "$(id -u)" != "0" ] && error "Запускайте от root"
 
 # --- Определение архитектуры ---
 ARCH=$(uname -m)
@@ -31,40 +29,58 @@ info "Архитектура: $ARCH -> $TAILSCALE_ARCH"
 FREE_SPACE_MB=$(df / | awk 'NR==2 {print int($4/1024)}')
 info "Свободно в / : ${FREE_SPACE_MB} MiB"
 
-# --- Функции установки ---
-install_via_apk() {
-    if command -v apk >/dev/null 2>&1; then
-        info "Попытка установки через apk..."
-        apk update || return 1
-        apk add tailscale || return 1
-        return 0
-    fi
-    return 1
-}
-
-install_via_download() {
-    warn "Установка через apk недоступна или не удалась. Скачиваем бинарники."
-    if [ "$FREE_SPACE_MB" -lt 25 ]; then
-        INSTALL_DIR="/tmp/tailscale"
-        mkdir -p "$INSTALL_DIR" || return 1
-        BIN_DIR="$INSTALL_DIR"
+# --- Проверка наличия Tailscale ---
+if command -v tailscale >/dev/null 2>&1; then
+    info "Tailscale уже установлен."
+    if [ -t 0 ] && [ -t 1 ]; then
+        echo ""
+        printf "Хотите только перенастроить сеть/файрвол и перезапустить туннель? (y/N): "
+        read -r reconf
+        case "$reconf" in
+            y|Y|yes|Yes)
+                info "Продолжаем с перенастройкой."
+                ;;
+            *)
+                info "Выход. Никаких изменений не внесено."
+                exit 0
+                ;;
+        esac
     else
-        INSTALL_DIR="/usr/sbin"
-        BIN_DIR="$INSTALL_DIR"
+        info "Неинтерактивный режим: продолжаем с настройкой (без переустановки)."
     fi
-    info "Скачивание бинарных файлов в $BIN_DIR..."
-    wget -O "${BIN_DIR}/tailscaled" "https://pkgs.tailscale.com/stable/${TAILSCALE_ARCH}/tailscaled" || return 1
-    wget -O "${BIN_DIR}/tailscale" "https://pkgs.tailscale.com/stable/${TAILSCALE_ARCH}/tailscale" || return 1
-    chmod +x "${BIN_DIR}/tailscaled" "${BIN_DIR}/tailscale" || return 1
-    if [ "$INSTALL_DIR" = "/tmp/tailscale" ]; then
-        ln -sf "${BIN_DIR}/tailscale" /usr/bin/tailscale || return 1
-        ln -sf "${BIN_DIR}/tailscaled" /usr/sbin/tailscaled || return 1
-    fi
-    return 0
-}
+else
+    # --- Установка Tailscale ---
+    install_via_apk() {
+        if command -v apk >/dev/null 2>&1; then
+            info "Попытка установки через apk..."
+            apk update || return 1
+            apk add tailscale || return 1
+            return 0
+        fi
+        return 1
+    }
 
-# --- Установка ---
-if ! command -v tailscale >/dev/null 2>&1; then
+    install_via_download() {
+        warn "Установка через apk недоступна или не удалась. Скачиваем бинарники."
+        if [ "$FREE_SPACE_MB" -lt 25 ]; then
+            INSTALL_DIR="/tmp/tailscale"
+            mkdir -p "$INSTALL_DIR" || return 1
+            BIN_DIR="$INSTALL_DIR"
+        else
+            INSTALL_DIR="/usr/sbin"
+            BIN_DIR="$INSTALL_DIR"
+        fi
+        info "Скачивание бинарных файлов в $BIN_DIR..."
+        wget -O "${BIN_DIR}/tailscaled" "https://pkgs.tailscale.com/stable/${TAILSCALE_ARCH}/tailscaled" || return 1
+        wget -O "${BIN_DIR}/tailscale" "https://pkgs.tailscale.com/stable/${TAILSCALE_ARCH}/tailscale" || return 1
+        chmod +x "${BIN_DIR}/tailscaled" "${BIN_DIR}/tailscale" || return 1
+        if [ "$INSTALL_DIR" = "/tmp/tailscale" ]; then
+            ln -sf "${BIN_DIR}/tailscale" /usr/bin/tailscale || return 1
+            ln -sf "${BIN_DIR}/tailscaled" /usr/sbin/tailscaled || return 1
+        fi
+        return 0
+    }
+
     if [ "$FREE_SPACE_MB" -ge 25 ]; then
         if install_via_apk; then
             info "Tailscale успешно установлен через apk."
@@ -74,54 +90,41 @@ if ! command -v tailscale >/dev/null 2>&1; then
     else
         install_via_download || error "Не удалось установить Tailscale."
     fi
-else
-    info "Tailscale уже установлен."
+
+    # Проверяем наличие после установки
+    if ! command -v tailscale >/dev/null 2>&1; then
+        error "Не удалось установить Tailscale."
+    fi
 fi
 
-# Проверяем наличие исполняемых файлов
-if ! command -v tailscale >/dev/null 2>&1; then
-    error "Не удалось установить Tailscale."
-fi
-
-# --- Функция автоматического определения подсети (всегда возвращает 0) ---
+# --- Определение подсети ---
 get_lan_subnet() {
-    # Пытаемся получить из uci
     local lan_ip=$(uci get network.lan.ipaddr 2>/dev/null)
     local lan_mask=$(uci get network.lan.netmask 2>/dev/null)
     if [ -n "$lan_ip" ] && [ -n "$lan_mask" ]; then
         if command -v ipcalc.sh >/dev/null 2>&1; then
             subnet=$(ipcalc.sh "$lan_ip" "$lan_mask" 2>/dev/null | grep NETWORK | cut -d= -f2)
-            if [ -n "$subnet" ]; then
-                echo "$subnet"
-                return 0
-            fi
+            [ -n "$subnet" ] && echo "$subnet" && return 0
         fi
-        # Если маска /24, заменяем последний октет на 0
         if echo "$lan_mask" | grep -q "255.255.255.0"; then
             echo "$(echo "$lan_ip" | cut -d. -f1-3).0/24"
             return 0
         fi
     fi
-    # Пробуем через ip addr для интерфейса br-lan или lan
     local iface="br-lan"
     local addr=$(ip -4 addr show "$iface" 2>/dev/null | grep inet | awk '{print $2}' | head -1)
     if [ -n "$addr" ]; then
-        network=$(echo "$addr" | sed 's/\.[0-9]*\//.0\//')
-        echo "$network"
+        echo "$addr" | sed 's/\.[0-9]*\//.0\//'
         return 0
     fi
-    # Ничего не нашли
     return 0
 }
 
-# --- Интерактивный выбор подсети (всегда возвращает 0) ---
 select_subnet_interactively() {
-    # Собираем список интерфейсов с IPv4-адресами (исключаем lo, tailscale*, dummy*)
     local items=""
     local idx=0
     local iface_list=$(ip -4 addr show 2>/dev/null | grep -E '^[0-9]+:' | awk -F': ' '{print $2}')
     for iface in $iface_list; do
-        # пропускаем lo, tailscale*, dummy*
         case "$iface" in
             lo|tailscale*|dummy*) continue ;;
         esac
@@ -143,16 +146,16 @@ select_subnet_interactively() {
     echo "Доступные локальные сети (интерфейсы с IPv4):"
     printf "%b" "$items" | column -t -s ')' || echo "$items"
     echo ""
-    printf "Выберите номер интерфейса, который будет рекламироваться как локальная подсеть (или введите 0 для пропуска): "
+    printf "Выберите номер интерфейса для рекламы (0 для пропуска): "
     read -r choice
 
     if [ -z "$choice" ] || [ "$choice" -eq 0 ]; then
-        warn "Выбор пропущен, реклама маршрутов отключена."
+        warn "Реклама маршрутов отключена."
         return 0
     fi
 
     if ! echo "$choice" | grep -q '^[0-9]\+$' || [ "$choice" -gt "$idx" ] || [ "$choice" -lt 1 ]; then
-        warn "Неверный номер. Реклама маршрутов пропущена."
+        warn "Неверный номер."
         return 0
     fi
 
@@ -160,7 +163,6 @@ select_subnet_interactively() {
     eval "selected_iface=\$iface_$choice"
     info "Выбран интерфейс $selected_iface с адресом $selected_addr"
 
-    # Вычисляем подсеть
     if command -v ipcalc.sh >/dev/null 2>&1; then
         ip_part=$(echo "$selected_addr" | cut -d/ -f1)
         mask_part=$(echo "$selected_addr" | cut -d/ -f2)
@@ -171,80 +173,52 @@ select_subnet_interactively() {
         fi
     fi
 
-    # Fallback: если маска /24, заменяем последний октет на 0
     if echo "$selected_addr" | grep -q '/24$'; then
-        network=$(echo "$selected_addr" | sed 's/\.[0-9]*\/24/.0\/24/')
-        echo "$network"
+        echo "$selected_addr" | sed 's/\.[0-9]*\/24/.0\/24/'
         return 0
     fi
 
-    # Если ничего не вышло, предлагаем ввести вручную
-    warn "Не удалось автоматически вычислить подсеть для $selected_addr."
-    printf "Введите подсеть вручную (например, 192.168.7.0/24) или оставьте пустым для пропуска: "
+    warn "Не удалось вычислить подсеть для $selected_addr."
+    printf "Введите вручную (например, 192.168.7.0/24) или оставьте пустым: "
     read -r manual_subnet
-    if [ -n "$manual_subnet" ]; then
-        echo "$manual_subnet"
-    fi
+    [ -n "$manual_subnet" ] && echo "$manual_subnet"
     return 0
 }
 
-# --- Определение подсети ---
 LAN_SUBNET=""
-
-# Пробуем автоматическое определение
 AUTO_SUBNET=$(get_lan_subnet)
 if [ -n "$AUTO_SUBNET" ]; then
     info "Автоматически определена подсеть: $AUTO_SUBNET"
-    # Если есть tty, спросим подтверждение
     if [ -t 0 ] && [ -t 1 ]; then
-        echo ""
         printf "Использовать её? (Y/n): "
         read -r use_auto
         case "$use_auto" in
-            n|N)
-                # переходим к ручному выбору
-                ;;
-            *)
-                LAN_SUBNET="$AUTO_SUBNET"
-                info "Используем автоматическую подсеть: $LAN_SUBNET"
-                ;;
+            n|N) ;;
+            *) LAN_SUBNET="$AUTO_SUBNET" ;;
         esac
     else
         LAN_SUBNET="$AUTO_SUBNET"
     fi
 fi
 
-# Если ещё не определена и есть tty, запускаем интерактивный выбор
 if [ -z "$LAN_SUBNET" ] && [ -t 0 ] && [ -t 1 ]; then
     SELECTED=$(select_subnet_interactively)
-    if [ -n "$SELECTED" ]; then
-        LAN_SUBNET="$SELECTED"
-        info "Выбрана подсеть: $LAN_SUBNET"
-    else
-        warn "Подсеть не выбрана, реклама маршрутов будет пропущена."
-    fi
+    [ -n "$SELECTED" ] && LAN_SUBNET="$SELECTED"
 fi
 
-# Если всё ещё нет, проверяем переменную окружения
 if [ -z "$LAN_SUBNET" ] && [ -n "$TAILSCALE_SUBNET" ]; then
     LAN_SUBNET="$TAILSCALE_SUBNET"
     info "Используем подсеть из переменной окружения: $LAN_SUBNET"
 fi
 
-if [ -z "$LAN_SUBNET" ]; then
-    warn "Не удалось определить локальную подсеть. Реклама маршрутов будет пропущена."
-fi
+[ -z "$LAN_SUBNET" ] && warn "Реклама маршрутов будет пропущена."
 
-# Формируем команду для tailscale up
 TAILSCALE_CMD="tailscale up --accept-dns=false --advertise-exit-node --ssh --netfilter-mode=off"
-if [ -n "$LAN_SUBNET" ]; then
-    TAILSCALE_CMD="$TAILSCALE_CMD --advertise-routes=$LAN_SUBNET"
-fi
+[ -n "$LAN_SUBNET" ] && TAILSCALE_CMD="$TAILSCALE_CMD --advertise-routes=$LAN_SUBNET"
 
-# --- Настройка сети и файрвола (с проверками) ---
+# --- Настройка сети и файрвола ---
 info "Настройка сети и файрвола..."
 
-# Интерфейс tailscale
 if ! uci get network.tailscale >/dev/null 2>&1; then
     uci set network.tailscale=interface
     uci set network.tailscale.device='tailscale0'
@@ -255,7 +229,6 @@ else
     info "Интерфейс tailscale уже существует."
 fi
 
-# Зона файрвола tailscale
 if ! uci show firewall 2>/dev/null | grep -q "zone.tailscale"; then
     uci add firewall zone
     uci set firewall.@zone[-1].name='tailscale'
@@ -270,7 +243,6 @@ else
     info "Зона tailscale уже существует."
 fi
 
-# Forwarding tailscale -> lan
 if ! uci show firewall 2>/dev/null | grep -q "forwarding.*src='tailscale'.*dest='lan'"; then
     uci add firewall forwarding
     uci set firewall.@forwarding[-1].src='tailscale'
@@ -280,7 +252,6 @@ else
     info "Правило forwarding tailscale -> lan уже существует."
 fi
 
-# Forwarding tailscale -> wan
 if ! uci show firewall 2>/dev/null | grep -q "forwarding.*src='tailscale'.*dest='wan'"; then
     uci add firewall forwarding
     uci set firewall.@forwarding[-1].src='tailscale'
@@ -290,7 +261,6 @@ else
     info "Правило forwarding tailscale -> wan уже существует."
 fi
 
-# Правило для SSH
 if ! uci show firewall 2>/dev/null | grep -q "rule.*name='Allow-Tailscale-SSH'"; then
     uci add firewall rule
     uci set firewall.@rule[-1].name='Allow-Tailscale-SSH'
@@ -303,7 +273,6 @@ else
     info "Правило Allow-Tailscale-SSH уже существует."
 fi
 
-# Правило для веб-интерфейса
 if ! uci show firewall 2>/dev/null | grep -q "rule.*name='Allow-Tailscale-Web'"; then
     uci add firewall rule
     uci set firewall.@rule[-1].name='Allow-Tailscale-Web'
@@ -316,7 +285,6 @@ else
     info "Правило Allow-Tailscale-Web уже существует."
 fi
 
-# Применение настроек
 uci commit network
 uci commit firewall
 /etc/init.d/network reload
@@ -346,19 +314,17 @@ EOF
     info "Init-скрипт /etc/init.d/tailscale создан."
 fi
 
-# Включаем и запускаем демон
 /etc/init.d/tailscale enable
 /etc/init.d/tailscale start
 info "Демон tailscaled запущен."
 
-# --- Добавление автозапуска туннеля в rc.local ---
+# --- Автозапуск туннеля в rc.local ---
 if ! grep -q "tailscale up" /etc/rc.local 2>/dev/null; then
     if [ ! -f /etc/rc.local ]; then
         echo "#!/bin/sh" > /etc/rc.local
         echo "exit 0" >> /etc/rc.local
         chmod +x /etc/rc.local
     fi
-    # Экранируем & для sed
     CMD_ESC=$(echo "$TAILSCALE_CMD" | sed 's/&/\\&/g')
     sed -i "/exit 0/i sleep 10 && $CMD_ESC &" /etc/rc.local
     info "Автозапуск туннеля добавлен в /etc/rc.local."
@@ -370,7 +336,7 @@ fi
 info "Запускаем туннель Tailscale..."
 $TAILSCALE_CMD || {
     warn "Не удалось запустить туннель автоматически."
-    info "Попробуйте выполнить вручную: $TAILSCALE_CMD"
+    info "Попробуйте вручную: $TAILSCALE_CMD"
 }
 
 # --- Вывод информации об авторизации ---
@@ -403,7 +369,5 @@ fi
 echo ""
 echo "После авторизации в админке Tailscale включите для этого устройства опцию 'Exit node'."
 echo "Роутер будет доступен по Tailscale IP для веба и SSH."
-if [ -n "$LAN_SUBNET" ]; then
-    echo "Рекламируется подсеть: $LAN_SUBNET (для доступа к локальным устройствам)."
-fi
+[ -n "$LAN_SUBNET" ] && echo "Рекламируется подсеть: $LAN_SUBNET (для доступа к локальным устройствам)."
 echo "Туннель автоматически запустится после перезагрузки."
