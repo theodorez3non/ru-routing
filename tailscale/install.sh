@@ -49,6 +49,42 @@ install_dependencies() {
 
 install_dependencies
 
+# --- Функция для поиска tailscale в системе ---
+find_tailscale() {
+    # Проверяем стандартные пути
+    for path in /usr/sbin/tailscale /usr/bin/tailscale /opt/bin/tailscale; do
+        if [ -f "$path" ]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    # Ищем через find (может быть долго, но надёжно)
+    find /usr -name "tailscale" -type f -executable 2>/dev/null | head -1
+    return 1
+}
+
+# --- Функция проверки доступности tailscale ---
+check_tailscale() {
+    # Добавляем /usr/sbin в PATH, если ещё нет
+    if ! echo "$PATH" | grep -q "/usr/sbin"; then
+        export PATH="/usr/sbin:$PATH"
+    fi
+    if command -v tailscale >/dev/null 2>&1; then
+        return 0
+    fi
+    # Пробуем найти бинарник вручную
+    TS_BIN=$(find_tailscale)
+    if [ -n "$TS_BIN" ]; then
+        # Создаём симлинк в /usr/bin, если он не в PATH
+        if [ ! -f "/usr/bin/tailscale" ]; then
+            ln -sf "$TS_BIN" /usr/bin/tailscale 2>/dev/null
+        fi
+        export PATH="/usr/bin:/usr/sbin:$PATH"
+        command -v tailscale >/dev/null 2>&1 && return 0
+    fi
+    return 1
+}
+
 # --- Функции установки ---
 install_via_package_manager() {
     if [ "$PKG_MANAGER" = "apk" ]; then
@@ -80,74 +116,60 @@ install_via_download() {
     if [ "$INSTALL_DIR" = "/tmp/tailscale" ]; then
         ln -sf "${BIN_DIR}/tailscale" /usr/bin/tailscale || return 1
         ln -sf "${BIN_DIR}/tailscaled" /usr/sbin/tailscaled || return 1
+    else
+        # Если установили в /usr/sbin, создаём симлинк в /usr/bin для удобства
+        ln -sf /usr/sbin/tailscale /usr/bin/tailscale 2>/dev/null || true
     fi
+    # Добавляем /usr/sbin в PATH
+    export PATH="/usr/sbin:/usr/bin:$PATH"
     return 0
 }
 
-# --- Функция проверки наличия tailscale ---
-check_tailscale() {
-    if command -v tailscale >/dev/null 2>&1; then
-        return 0
-    fi
-    # Проверяем стандартные пути
-    if [ -f "/usr/sbin/tailscale" ] || [ -f "/usr/bin/tailscale" ]; then
-        # Создаём симлинк, если нужно
-        if [ ! -f "/usr/bin/tailscale" ] && [ -f "/usr/sbin/tailscale" ]; then
-            ln -sf /usr/sbin/tailscale /usr/bin/tailscale 2>/dev/null || true
-        fi
-        if [ ! -f "/usr/sbin/tailscale" ] && [ -f "/usr/bin/tailscale" ]; then
-            ln -sf /usr/bin/tailscale /usr/sbin/tailscale 2>/dev/null || true
-        fi
-        export PATH="$PATH:/usr/sbin:/usr/bin"
-        command -v tailscale >/dev/null 2>&1 && return 0
-    fi
-    return 1
-}
-
-# --- Установка Tailscale (если не установлен) ---
+# --- Основная установка ---
+# Проверяем, доступен ли tailscale
 if check_tailscale; then
-    info "Tailscale уже установлен и доступен в PATH."
+    info "Tailscale уже установлен и доступен."
 else
     # Пытаемся установить через пакетный менеджер
     if [ "$FREE_SPACE_MB" -ge 25 ]; then
+        info "Попытка установки через пакетный менеджер..."
         if install_via_package_manager; then
-            info "Tailscale успешно установлен через пакетный менеджер."
-            # После установки через opkg может потребоваться перезагрузка или обновление PATH
-            # Проверяем ещё раз
-            if ! check_tailscale; then
-                warn "Бинарники установлены, но не найдены в PATH. Ищем вручную..."
-                # Ищем файлы tailscale и tailscaled
-                TS_BIN=$(find /usr -name "tailscale" -type f 2>/dev/null | head -1)
-                TSD_BIN=$(find /usr -name "tailscaled" -type f 2>/dev/null | head -1)
-                if [ -n "$TS_BIN" ] && [ -n "$TSD_BIN" ]; then
-                    info "Найдены бинарники: $TS_BIN и $TSD_BIN"
-                    chmod +x "$TS_BIN" "$TSD_BIN" 2>/dev/null || true
-                    ln -sf "$TS_BIN" /usr/bin/tailscale 2>/dev/null || true
-                    ln -sf "$TSD_BIN" /usr/sbin/tailscaled 2>/dev/null || true
-                    export PATH="$PATH:/usr/bin:/usr/sbin"
+            info "Установка через пакетный менеджер выполнена."
+            # После установки проверяем снова
+            if check_tailscale; then
+                info "Tailscale успешно установлен."
+            else
+                warn "Пакет установлен, но бинарники не найдены. Пытаемся найти вручную..."
+                TS_BIN=$(find_tailscale)
+                if [ -n "$TS_BIN" ]; then
+                    info "Найден бинарник: $TS_BIN"
+                    ln -sf "$TS_BIN" /usr/bin/tailscale 2>/dev/null
+                    export PATH="/usr/bin:/usr/sbin:$PATH"
                     if command -v tailscale >/dev/null 2>&1; then
-                        info "Tailscale успешно настроен."
+                        info "Tailscale теперь доступен."
                     else
-                        warn "Не удалось добавить tailscale в PATH. Попробуйте выполнить вручную:"
-                        echo "  export PATH=\$PATH:/usr/bin:/usr/sbin"
+                        warn "Не удалось добавить tailscale в PATH. Выполните вручную:"
+                        echo "  export PATH=/usr/sbin:\$PATH"
                         echo "  tailscale up ..."
                     fi
                 else
-                    warn "Бинарники не найдены. Возможно, установка прошла с ошибкой."
+                    warn "Бинарники не найдены. Пробуем скачать вручную..."
                     install_via_download || error "Не удалось установить Tailscale."
                 fi
             fi
         else
+            warn "Установка через пакетный менеджер не удалась. Пробуем скачать бинарники..."
             install_via_download || error "Не удалось установить Tailscale."
         fi
     else
+        warn "Мало свободного места. Пробуем установить в /tmp..."
         install_via_download || error "Не удалось установить Tailscale."
     fi
 fi
 
 # Финальная проверка
 if ! check_tailscale; then
-    error "Tailscale не установлен или не доступен в PATH. Попробуйте перезагрузить роутер и запустить скрипт снова."
+    error "Не удалось найти tailscale. Попробуйте перезагрузить роутер и запустить скрипт снова."
 fi
 
 # --- Формируем команду запуска (без рекламы подсетей) ---
