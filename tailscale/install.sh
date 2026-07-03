@@ -17,7 +17,8 @@ set -u
 readonly SCRIPT_TITLE="Tailscale installer for OpenWrt"
 
 readonly TAILSCALE_PKG="tailscale"
-readonly TAILSCALE_INIT="/etc/init.d/tailscale"
+readonly TAILSCALE_INIT_DEFAULT="/etc/init.d/tailscale"
+readonly TAILSCALE_CONFIG="/etc/config/tailscale"
 readonly TAILSCALE_UP_ARGS="--advertise-exit-node --accept-dns=false --netfilter-mode=off --ssh"
 
 readonly NET_INTERFACE="tailscale"
@@ -49,6 +50,7 @@ SYS_ARCH=""
 SYS_VERSION=""
 SYS_PM=""
 SYS_FREE_KIB=""
+TAILSCALE_INIT_PATH=""
 
 # =============================================================================
 # Цвета терминала
@@ -236,6 +238,22 @@ pm_install() {
     esac
 }
 
+pm_reinstall() {
+    _pkg="$1"
+
+    case "$SYS_PM" in
+        apk)
+            apk add --force-overwrite "$_pkg" || return 1
+            ;;
+        opkg)
+            opkg install --force-reinstall "$_pkg" || return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 install_dependencies() {
     log_step "Установка зависимостей"
 
@@ -322,12 +340,21 @@ install_tailscale() {
 
 ensure_tailscale_installed() {
     if is_tailscale_package_installed; then
-        log_ok "Пакет $TAILSCALE_PKG уже установлен — переустановка не требуется."
-        verify_tailscale_binaries || die "Пакет установлен, но бинарники tailscale/tailscaled недоступны."
+        if is_init_script_executable "$TAILSCALE_INIT_DEFAULT" \
+            || is_init_script_executable "$(init_script_from_package_list)"; then
+            log_ok "Пакет $TAILSCALE_PKG уже установлен — переустановка не требуется."
+            verify_tailscale_binaries || die "Пакет установлен, но бинарники tailscale/tailscaled недоступны."
+            return 0
+        fi
+
+        log_warn "Пакет $TAILSCALE_PKG установлен, но init-скрипт отсутствует."
+        reinstall_tailscale_package || die "Не удалось восстановить файлы пакета $TAILSCALE_PKG."
+        verify_tailscale_binaries || die "После переустановки бинарники tailscale/tailscaled недоступны."
         return 0
     fi
 
-    if binary_in_path tailscale && binary_in_path tailscaled; then
+    if binary_in_path tailscale && binary_in_path tailscaled \
+        && is_init_script_executable "$TAILSCALE_INIT_DEFAULT"; then
         log_ok "Бинарники Tailscale уже доступны — установка пакета не требуется."
         return 0
     fi
@@ -339,21 +366,82 @@ ensure_tailscale_installed() {
 # Сервис Tailscale (штатный init.d из пакета)
 # =============================================================================
 
-ensure_init_script_exists() {
-    if [ ! -x "$TAILSCALE_INIT" ]; then
-        die "Init-скрипт $TAILSCALE_INIT не найден. Пакет Tailscale установлен некорректно."
+init_script_from_package_list() {
+    case "$SYS_PM" in
+        opkg)
+            opkg files "$TAILSCALE_PKG" 2>/dev/null | grep '/etc/init.d/' | head -n 1
+            ;;
+        apk)
+            apk info -L "$TAILSCALE_PKG" 2>/dev/null | grep '/etc/init.d/' | head -n 1
+            ;;
+    esac
+}
+
+is_init_script_executable() {
+    _path="$1"
+    [ -n "$_path" ] && [ -x "$_path" ]
+}
+
+reinstall_tailscale_package() {
+    log_warn "Файлы пакета $TAILSCALE_PKG повреждены или удалены — выполняем переустановку..."
+
+    pm_update_indexes || return 1
+    pm_reinstall "$TAILSCALE_PKG" || return 1
+
+    log_ok "Пакет $TAILSCALE_PKG переустановлен."
+    return 0
+}
+
+resolve_tailscale_init_path() {
+    if is_init_script_executable "$TAILSCALE_INIT_DEFAULT"; then
+        TAILSCALE_INIT_PATH="$TAILSCALE_INIT_DEFAULT"
+        return 0
     fi
+
+    _pkg_init="$(init_script_from_package_list)"
+    if is_init_script_executable "$_pkg_init"; then
+        TAILSCALE_INIT_PATH="$_pkg_init"
+        return 0
+    fi
+
+    if ! is_tailscale_package_installed; then
+        return 1
+    fi
+
+    reinstall_tailscale_package || return 1
+
+    if is_init_script_executable "$TAILSCALE_INIT_DEFAULT"; then
+        TAILSCALE_INIT_PATH="$TAILSCALE_INIT_DEFAULT"
+        return 0
+    fi
+
+    _pkg_init="$(init_script_from_package_list)"
+    if is_init_script_executable "$_pkg_init"; then
+        TAILSCALE_INIT_PATH="$_pkg_init"
+        return 0
+    fi
+
+    return 1
+}
+
+ensure_init_script_exists() {
+    if resolve_tailscale_init_path; then
+        log_ok "Init-скрипт найден: $TAILSCALE_INIT_PATH"
+        return 0
+    fi
+
+    die "Init-скрипт Tailscale не найден. Выполните: $SYS_PM install --force-reinstall $TAILSCALE_PKG"
 }
 
 enable_service() {
     log_info "Включение автозапуска сервиса Tailscale..."
-    "$TAILSCALE_INIT" enable || die "Не удалось включить автозапуск сервиса Tailscale."
+    "$TAILSCALE_INIT_PATH" enable || die "Не удалось включить автозапуск сервиса Tailscale."
     log_ok "Автозапуск включён."
 }
 
 start_service() {
     log_info "Запуск сервиса Tailscale..."
-    "$TAILSCALE_INIT" start || die "Не удалось запустить сервис Tailscale."
+    "$TAILSCALE_INIT_PATH" start || die "Не удалось запустить сервис Tailscale."
 }
 
 is_daemon_running() {

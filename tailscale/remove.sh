@@ -19,8 +19,14 @@ tailscale down 2>/dev/null || true
 /etc/init.d/tailscale stop 2>/dev/null || true
 /etc/init.d/tailscale disable 2>/dev/null || true
 
-info "Удаляем пакет через apk (если установлен)..."
-apk del tailscale 2>/dev/null || info "Пакет не найден через apk"
+info "Удаляем пакет Tailscale..."
+if command -v apk >/dev/null 2>&1; then
+    apk del tailscale 2>/dev/null || info "Пакет не найден через apk"
+elif command -v opkg >/dev/null 2>&1; then
+    opkg remove tailscale 2>/dev/null || info "Пакет не найден через opkg"
+else
+    warn "Пакетный менеджер не найден — удаляем файлы вручную"
+fi
 
 info "Удаляем бинарные файлы (если остались)..."
 rm -f /usr/sbin/tailscaled /usr/sbin/tailscale /usr/bin/tailscale /usr/bin/tailscaled
@@ -47,10 +53,9 @@ uci commit network
 /etc/init.d/network reload
 
 info "Удаляем автозапуск из rc.local..."
-sed -i '/tailscale up/d' /etc/rc.local
-
-info "Удаляем init-скрипт Tailscale..."
-rm -f /etc/init.d/tailscale
+if [ -f /etc/rc.local ]; then
+    sed -i '/tailscale up/d' /etc/rc.local
+fi
 
 info "Чистка завершена. Tailscale удалён."
 
