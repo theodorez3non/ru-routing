@@ -184,6 +184,31 @@ validate_environment() {
     if [ "$SYS_FREE_KIB" -lt "$MIN_FREE_KIB" ] 2>/dev/null; then
         log_warn "Мало свободного места: ${SYS_FREE_KIB} KiB (рекомендуется >= ${MIN_FREE_KIB} KiB)."
     fi
+
+    validate_core_firewall_zones
+}
+
+validate_core_firewall_zones() {
+    _idx=0
+    _have_lan=0
+    _have_wan=0
+
+    while uci -q get "firewall.@zone[${_idx}]" >/dev/null 2>&1; do
+        _name="$(uci -q get "firewall.@zone[${_idx}].name" 2>/dev/null || true)"
+        if [ "$_name" = "lan" ]; then
+            _have_lan=1
+        fi
+        if [ "$_name" = "wan" ]; then
+            _have_wan=1
+        fi
+        _idx=$((_idx + 1))
+    done
+
+    if [ "$_have_lan" -eq 0 ] || [ "$_have_wan" -eq 0 ]; then
+        log_warn "Firewall повреждён: отсутствует зона lan и/или wan."
+        log_warn "Восстановите /etc/config/firewall перед продолжением."
+        log_warn "Пример: cp /etc/config/firewall-opkg /etc/config/firewall (если есть бэкап)."
+    fi
 }
 
 # =============================================================================
