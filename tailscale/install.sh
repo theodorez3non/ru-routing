@@ -1,6 +1,6 @@
 #!/bin/sh
-# Установка Tailscale + Exit Node + доступ к роутеру (без рекламы локальной сети)
-# Для OpenWrt 25.12 (apk)
+# Установка Tailscale + Exit Node + доступ к роутеру
+# Поддержка OpenWrt 24.10 (opkg) и 25.12 (apk)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -11,7 +11,6 @@ info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-# Проверка прав
 [ "$(id -u)" != "0" ] && error "Запускайте от root"
 
 # --- Определение архитектуры ---
@@ -29,19 +28,43 @@ info "Архитектура: $ARCH -> $TAILSCALE_ARCH"
 FREE_SPACE_MB=$(df / | awk 'NR==2 {print int($4/1024)}')
 info "Свободно в / : ${FREE_SPACE_MB} MiB"
 
+# --- Определение пакетного менеджера ---
+PKG_MANAGER="opkg"
+if command -v apk >/dev/null 2>&1; then
+    PKG_MANAGER="apk"
+    info "Используем пакетный менеджер: apk"
+else
+    info "Используем пакетный менеджер: opkg"
+fi
+
+# --- Установка зависимостей для скачивания ---
+install_dependencies() {
+    if [ "$PKG_MANAGER" = "apk" ]; then
+        apk add wget ca-bundle libustream-openssl kmod-tun 2>/dev/null || true
+    else
+        opkg update || return 1
+        opkg install wget ca-bundle libustream-openssl kmod-tun 2>/dev/null || true
+    fi
+}
+
+install_dependencies
+
 # --- Функции установки ---
-install_via_apk() {
-    if command -v apk >/dev/null 2>&1; then
+install_via_package_manager() {
+    if [ "$PKG_MANAGER" = "apk" ]; then
         info "Попытка установки через apk..."
         apk update || return 1
         apk add tailscale || return 1
-        return 0
+    else
+        info "Попытка установки через opkg..."
+        opkg update || return 1
+        opkg install tailscale || return 1
     fi
-    return 1
+    return 0
 }
 
 install_via_download() {
-    warn "Установка через apk недоступна или не удалась. Скачиваем бинарники."
+    warn "Установка через пакетный менеджер недоступна или не удалась. Скачиваем бинарники."
     if [ "$FREE_SPACE_MB" -lt 25 ]; then
         INSTALL_DIR="/tmp/tailscale"
         mkdir -p "$INSTALL_DIR" || return 1
@@ -51,8 +74,9 @@ install_via_download() {
         BIN_DIR="$INSTALL_DIR"
     fi
     info "Скачивание бинарных файлов в $BIN_DIR..."
-    wget -O "${BIN_DIR}/tailscaled" "https://pkgs.tailscale.com/stable/${TAILSCALE_ARCH}/tailscaled" || return 1
-    wget -O "${BIN_DIR}/tailscale" "https://pkgs.tailscale.com/stable/${TAILSCALE_ARCH}/tailscale" || return 1
+    # Используем wget с опциями для обхода проблем с сертификатами
+    wget --no-check-certificate -O "${BIN_DIR}/tailscaled" "https://pkgs.tailscale.com/stable/${TAILSCALE_ARCH}/tailscaled" || return 1
+    wget --no-check-certificate -O "${BIN_DIR}/tailscale" "https://pkgs.tailscale.com/stable/${TAILSCALE_ARCH}/tailscale" || return 1
     chmod +x "${BIN_DIR}/tailscaled" "${BIN_DIR}/tailscale" || return 1
     if [ "$INSTALL_DIR" = "/tmp/tailscale" ]; then
         ln -sf "${BIN_DIR}/tailscale" /usr/bin/tailscale || return 1
@@ -64,8 +88,8 @@ install_via_download() {
 # --- Установка Tailscale (если не установлен) ---
 if ! command -v tailscale >/dev/null 2>&1; then
     if [ "$FREE_SPACE_MB" -ge 25 ]; then
-        if install_via_apk; then
-            info "Tailscale успешно установлен через apk."
+        if install_via_package_manager; then
+            info "Tailscale успешно установлен через пакетный менеджер."
         else
             install_via_download || error "Не удалось установить Tailscale."
         fi
@@ -104,7 +128,7 @@ else
     info "Интерфейс tailscale уже существует."
 fi
 
-# 2. Зона файрвола tailscale (только для самого интерфейса)
+# 2. Зона файрвола tailscale
 if ! uci show firewall 2>/dev/null | grep -q "zone.tailscale"; then
     uci add firewall zone
     uci set firewall.@zone[-1].name='tailscale'
@@ -242,6 +266,6 @@ echo "После авторизации в админке Tailscale включи
 echo "Роутер будет доступен по Tailscale IP для веба и SSH."
 echo "Туннель автоматически запустится после перезагрузки."
 echo ""
-echo "ВНИМАНИЕ: доступ к локальной сети (192.168.7.0/24) через Tailscale не рекламируется."
+echo "ВНИМАНИЕ: доступ к локальной сети через Tailscale не рекламируется."
 echo "Если нужен доступ к другим устройствам в локальной сети, добавьте вручную:"
-echo "  tailscale up --advertise-routes=192.168.7.0/24"
+echo "  tailscale up --advertise-routes=<ваша_подсеть>"
