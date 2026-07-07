@@ -33,8 +33,7 @@ readonly PORT_SSH="22"
 readonly PORT_HTTP="80"
 readonly PORT_HTTPS="443"
 
-# Добавлен пакет tzdata для временных зон
-readonly DEP_PACKAGES="kmod-tun ca-bundle tzdata"
+readonly DEP_PACKAGES="kmod-tun ca-bundle"
 
 readonly MIN_FREE_KIB=10240
 readonly DAEMON_WAIT_SECS=30
