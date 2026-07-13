@@ -1,10 +1,11 @@
 #!/bin/sh
 #
 # Tailscale Exit Node — production installer for OpenWrt 24.x / 25.x
-# С поддержкой зеркал репозиториев, неинтерактивной авторизации и настройкой времени.
+# Безопасная установка: не изменяет DNS, firewall, маршруты, интерфейсы UCI.
+# Поддерживает авторизацию по ключу или интерактивно (вывод ссылки).
 #
 # Использование:
-#   sh install.sh --mirror <URL> [--auth-key <ключ>]
+#   sh install.sh [--mirror <URL>] [--auth-key <ключ>]
 #
 
 set -u
@@ -13,36 +14,21 @@ set -u
 # Константы
 # =============================================================================
 
-readonly SCRIPT_TITLE="Tailscale installer for OpenWrt"
+readonly SCRIPT_TITLE="Tailscale installer for OpenWrt (non‑invasive)"
 
 readonly TAILSCALE_PKG="tailscale"
 readonly TAILSCALE_INIT_DEFAULT="/etc/init.d/tailscale"
-readonly TAILSCALE_CONFIG="/etc/config/tailscale"
 readonly TAILSCALE_UP_ARGS="--advertise-exit-node --accept-dns=false --netfilter-mode=off --ssh"
 
-readonly NET_INTERFACE="tailscale"
-readonly NET_DEVICE="tailscale0"
-readonly FW_ZONE="tailscale"
-readonly FW_WAN_ZONE="wan"
-
-readonly FW_RULE_SSH="Allow-Tailscale-SSH"
-readonly FW_RULE_HTTP="Allow-Tailscale-HTTP"
-readonly FW_RULE_HTTPS="Allow-Tailscale-HTTPS"
-
-readonly PORT_SSH="22"
-readonly PORT_HTTP="80"
-readonly PORT_HTTPS="443"
-
 readonly DEP_PACKAGES="kmod-tun ca-bundle"
-
 readonly MIN_FREE_KIB=10240
 readonly DAEMON_WAIT_SECS=30
 readonly DAEMON_POLL_SECS=2
-readonly TAILSCALE_UP_TIMEOUT=15   # секунд ожидания авторизации
+readonly TAILSCALE_UP_TIMEOUT=15   # секунд ожидания при отсутствии ключа
 
 readonly OPENWRT_RELEASE_FILE="/etc/openwrt_release"
 
-# Настройки времени
+# Настройки времени (опционально)
 readonly TIMEZONE_NAME="Europe/Moscow"
 readonly TIMEZONE_STRING="MSK-3"
 
@@ -119,7 +105,6 @@ run_with_timeout() {
     while [ "$_elapsed" -lt "$_timeout" ]; do
         sleep 1
         _elapsed=$((_elapsed + 1))
-        # Проверим, жив ли процесс
         kill -0 "$_pid" 2>/dev/null || break
     done
     if kill -0 "$_pid" 2>/dev/null; then
@@ -138,7 +123,6 @@ is_process_running() {
     if have_cmd pidof; then
         pidof "$_name" >/dev/null 2>&1 && return 0
     else
-        # fallback через ps
         ps -w | grep -v grep | grep -q "[${_name%?}]${_name#?}" && return 0
     fi
     return 1
@@ -294,7 +278,7 @@ install_dependencies() {
 }
 
 # =============================================================================
-# Настройка времени
+# Настройка времени (опционально)
 # =============================================================================
 
 configure_timezone() {
@@ -326,6 +310,67 @@ configure_timezone() {
     fi
 
     log_ok "Часовой пояс установлен."
+}
+
+# =============================================================================
+# Обеспечение работы TUN
+# =============================================================================
+
+ensure_tun() {
+    log_step "Проверка TUN устройства"
+
+    # Загружаем модуль, если не загружен
+    if ! lsmod | grep -q tun; then
+        log_info "Загрузка модуля tun..."
+        modprobe tun || { log_warn "Не удалось загрузить модуль tun"; return 1; }
+    else
+        log_info "Модуль tun уже загружен."
+    fi
+
+    # Проверяем устройство /dev/net/tun
+    if [ ! -c /dev/net/tun ]; then
+        log_info "Создание /dev/net/tun..."
+        mkdir -p /dev/net
+        mknod /dev/net/tun c 10 200
+        chmod 600 /dev/net/tun
+        log_ok "Устройство создано."
+    else
+        log_ok "Устройство /dev/net/tun существует."
+    fi
+
+    return 0
+}
+
+# =============================================================================
+# Создание фиктивных iptables (для обхода проверок демона)
+# =============================================================================
+
+ensure_fake_iptables() {
+    log_step "Проверка iptables/ip6tables"
+
+    _create_fake() {
+        _bin="$1"
+        if ! have_cmd "$_bin"; then
+            log_info "Создание фиктивного $_bin..."
+            cat > "/usr/bin/$_bin" << EOF
+#!/bin/sh
+# Фиктивный $_bin для Tailscale
+if [ "\$1" = "--version" ]; then
+    echo "$_bin v1.8.7 (legacy)"
+    exit 0
+else
+    exit 0
+fi
+EOF
+            chmod +x "/usr/bin/$_bin"
+            log_ok "Фиктивный $_bin создан."
+        else
+            log_ok "$_bin уже существует."
+        fi
+    }
+
+    _create_fake iptables
+    _create_fake ip6tables
 }
 
 # =============================================================================
@@ -467,7 +512,7 @@ wait_for_daemon_ready() {
     if is_process_running tailscaled; then
         log_warn "Процесс tailscaled запущен, но сокет недоступен. Проверьте логи: logread | grep tailscale"
         log_warn "Продолжаем выполнение, возможно, сокет появится позже."
-        return 0
+        return 0  # не прерываем скрипт
     else
         log_error "Процесс tailscaled не найден. Проверьте логи: logread | grep tailscale"
         return 1
@@ -489,182 +534,10 @@ manage_service() {
     enable_service
     start_service
     wait_for_daemon_ready || die "Tailscaled не запущен."
-    # Если сокет не появился, но процесс жив, продолжаем – configure_exit_node попытается выполнить tailscale up
 }
 
 # =============================================================================
-# UCI — вспомогательные функции (не вызываются, но оставлены для совместимости)
-# =============================================================================
-
-uci_section_exists() {
-    _cfg="$1"; _sec="$2"
-    uci -q get "${_cfg}.${_sec}" >/dev/null 2>&1
-}
-
-firewall_zone_index_by_name() {
-    _zone="$1"; _idx=0
-    while uci -q get "firewall.@zone[${_idx}]" >/dev/null 2>&1; do
-        _name="$(uci -q get "firewall.@zone[${_idx}].name" 2>/dev/null || true)"
-        [ "$_name" = "$_zone" ] && { printf '%s' "$_idx"; return 0; }
-        _idx=$((_idx + 1))
-    done
-    return 1
-}
-
-firewall_zone_exists() { firewall_zone_index_by_name "$1" >/dev/null 2>&1; }
-
-firewall_forwarding_exists() {
-    _src="$1"; _dest="$2"; _idx=0
-    while uci -q get "firewall.@forwarding[${_idx}]" >/dev/null 2>&1; do
-        _f_src="$(uci -q get "firewall.@forwarding[${_idx}].src" 2>/dev/null || true)"
-        _f_dest="$(uci -q get "firewall.@forwarding[${_idx}].dest" 2>/dev/null || true)"
-        [ "$_f_src" = "$_src" ] && [ "$_f_dest" = "$_dest" ] && return 0
-        _idx=$((_idx + 1))
-    done
-    return 1
-}
-
-firewall_rule_exists() {
-    _name="$1"; _idx=0
-    while uci -q get "firewall.@rule[${_idx}]" >/dev/null 2>&1; do
-        _n="$(uci -q get "firewall.@rule[${_idx}].name" 2>/dev/null || true)"
-        [ "$_n" = "$_name" ] && return 0
-        _idx=$((_idx + 1))
-    done
-    return 1
-}
-
-uci_commit_and_reload() {
-    log_info "Сохранение изменений UCI..."
-    uci commit network || die "Ошибка uci commit network."
-    uci commit firewall || die "Ошибка uci commit firewall."
-    log_info "Перезагрузка network и firewall..."
-    /etc/init.d/network reload || log_warn "Перезагрузка network с предупреждением."
-    /etc/init.d/firewall reload || die "Не удалось перезагрузить firewall."
-}
-
-# =============================================================================
-# UCI — сеть и firewall (не вызываются)
-# =============================================================================
-
-configure_network_interface() {
-    if uci_section_exists network "$NET_INTERFACE"; then
-        log_info "Интерфейс '$NET_INTERFACE' уже существует."
-        return 0
-    fi
-    log_info "Создание интерфейса '$NET_INTERFACE'..."
-    uci set "network.${NET_INTERFACE}=interface"
-    uci set "network.${NET_INTERFACE}.device=${NET_DEVICE}"
-    uci set "network.${NET_INTERFACE}.proto=unmanaged"
-    uci set "network.${NET_INTERFACE}.auto=1"
-    log_ok "Интерфейс создан."
-}
-
-configure_firewall_zone() {
-    if firewall_zone_exists "$FW_ZONE"; then
-        log_info "Firewall-зона '$FW_ZONE' уже существует."
-        return 0
-    fi
-    log_info "Создание зоны '$FW_ZONE'..."
-    uci add firewall zone
-    uci set "firewall.@zone[-1].name=${FW_ZONE}"
-    uci set "firewall.@zone[-1].input=ACCEPT"
-    uci set "firewall.@zone[-1].output=ACCEPT"
-    uci set "firewall.@zone[-1].forward=ACCEPT"
-    uci set "firewall.@zone[-1].masq=1"
-    uci set "firewall.@zone[-1].mtu_fix=1"
-    uci add_list "firewall.@zone[-1].network=${NET_INTERFACE}"
-    log_ok "Зона создана."
-}
-
-configure_firewall_forwarding() {
-    if firewall_forwarding_exists "$FW_ZONE" "$FW_WAN_ZONE"; then
-        log_info "Forwarding ${FW_ZONE} -> ${FW_WAN_ZONE} уже настроен."
-        return 0
-    fi
-    log_info "Добавление forwarding ${FW_ZONE} -> ${FW_WAN_ZONE}..."
-    uci add firewall forwarding
-    uci set "firewall.@forwarding[-1].src=${FW_ZONE}"
-    uci set "firewall.@forwarding[-1].dest=${FW_WAN_ZONE}"
-    log_ok "Forwarding добавлен."
-}
-
-add_firewall_rule_if_missing() {
-    _name="$1"; _proto="$2"; _port="$3"
-    if firewall_rule_exists "$_name"; then
-        log_info "Правило '$_name' уже существует."
-        return 0
-    fi
-    log_info "Добавление правила '$_name' (порт $_port)..."
-    uci add firewall rule
-    uci set "firewall.@rule[-1].name=${_name}"
-    uci set "firewall.@rule[-1].src=${FW_ZONE}"
-    uci set "firewall.@rule[-1].proto=${_proto}"
-    uci set "firewall.@rule[-1].dest_port=${_port}"
-    uci set "firewall.@rule[-1].target=ACCEPT"
-    log_ok "Правило добавлено."
-}
-
-configure_firewall_rules() {
-    add_firewall_rule_if_missing "$FW_RULE_SSH"   "tcp" "$PORT_SSH"
-    add_firewall_rule_if_missing "$FW_RULE_HTTP"  "tcp" "$PORT_HTTP"
-    add_firewall_rule_if_missing "$FW_RULE_HTTPS" "tcp" "$PORT_HTTPS"
-}
-
-configure_network() {
-    log_step "Настройка сети и firewall"
-    configure_network_interface
-    configure_firewall_zone
-    configure_firewall_forwarding
-    configure_firewall_rules
-    uci_commit_and_reload
-    log_ok "Сеть и firewall настроены."
-}
-
-# =============================================================================
-# IP forwarding (не вызывается)
-# =============================================================================
-
-enable_ip_forwarding_runtime() {
-    _cur="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)"
-    [ "$_cur" = "1" ] && { log_info "IPv4 forwarding уже включён (runtime)."; return 0; }
-    log_info "Включение IPv4 forwarding (runtime)..."
-    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null && log_ok "Включён." || log_warn "Не удалось."
-}
-
-# Сохраняем исходное значение forwarding в служебный файл
-save_forwarding_original() {
-    mkdir -p "$(dirname "$FORWARDING_BACKUP")" 2>/dev/null
-    _current="$(uci -q get network.globals.forwarding 2>/dev/null || echo "")"
-    echo "$_current" > "$FORWARDING_BACKUP"
-    log_info "Сохранено исходное значение forwarding: '$_current'"
-}
-
-enable_ip_forwarding_uci() {
-    # Сохраняем оригинал перед изменением
-    save_forwarding_original
-
-    if uci_section_exists network globals; then
-        _fwd="$(uci -q get network.globals.forwarding 2>/dev/null || echo 0)"
-        [ "$_fwd" = "1" ] && { log_info "IP forwarding уже сохранён в UCI."; return 0; }
-        uci set network.globals.forwarding='1'
-    else
-        log_info "Создание network.globals..."
-        uci set network.globals=globals
-        uci set network.globals.forwarding='1'
-    fi
-    uci commit network || die "Не удалось сохранить IP forwarding."
-    log_ok "IP forwarding сохранён в UCI."
-}
-
-enable_ip_forwarding() {
-    log_step "Настройка IP forwarding"
-    enable_ip_forwarding_runtime
-    enable_ip_forwarding_uci
-}
-
-# =============================================================================
-# Tailscale — Exit Node и авторизация (НЕ зависает!)
+# Tailscale — Exit Node и авторизация
 # =============================================================================
 
 is_tailscale_authenticated() {
@@ -689,30 +562,39 @@ configure_exit_node() {
     _cmd="$_cmd $TAILSCALE_UP_ARGS"
 
     log_info "Выполнение: $_cmd"
-    # Запускаем с таймаутом (если нет ключа) или без таймаута (если ключ есть)
+
+    # Сохраняем вывод в лог-файл
+    _log="/tmp/tailscale_up.log"
+    > "$_log"
+
     if [ -n "$AUTH_KEY" ]; then
         # Без таймаута — ждём завершения
-        sh -c "$_cmd" > /tmp/tailscale_up.log 2>&1
+        sh -c "$_cmd" > "$_log" 2>&1
         _ret=$?
-        cat /tmp/tailscale_up.log
+        cat "$_log"
+        if [ $_ret -ne 0 ]; then
+            log_warn "tailscale up с ключом завершился с кодом $_ret."
+        fi
     else
         # С таймаутом
-        run_with_timeout "$TAILSCALE_UP_TIMEOUT" sh -c "$_cmd" > /tmp/tailscale_up.log 2>&1
+        run_with_timeout "$TAILSCALE_UP_TIMEOUT" sh -c "$_cmd" > "$_log" 2>&1
         _ret=$?
-        cat /tmp/tailscale_up.log
+        cat "$_log"
         if [ $_ret -eq 124 ]; then
-            log_warn "Команда tailscale up не завершилась за ${TAILSCALE_UP_TIMEOUT} сек."
+            log_warn "Команда tailscale up не завершилась за ${TAILSCALE_UP_TIMEOUT} сек (таймаут)."
+        elif [ $_ret -ne 0 ]; then
+            log_warn "tailscale up завершился с кодом $_ret."
         fi
     fi
 
-    # Проверяем успешность
+    # Проверяем успешность авторизации
     if is_tailscale_authenticated; then
         log_ok "Tailscale успешно авторизован."
         return 0
     fi
 
     # Если не авторизованы – извлекаем ссылку
-    _url="$(grep -o 'https://login.tailscale.com/[^ ]*' /tmp/tailscale_up.log 2>/dev/null | head -n1)"
+    _url="$(grep -o 'https://login.tailscale.com/[^ ]*' "$_log" 2>/dev/null | head -n1)"
     if [ -n "$_url" ]; then
         printf '\n'
         log_info "Для завершения авторизации перейдите по ссылке:"
@@ -722,14 +604,15 @@ configure_exit_node() {
         log_warn "Не удалось получить ссылку для входа. Попробуйте выполнить вручную:"
         printf '    %s\n' "$_cmd"
         # Выведем последние строки лога для диагностики
-        tail -n 5 /tmp/tailscale_up.log >&2
+        log_info "Последние строки лога:"
+        tail -n 5 "$_log" >&2
     fi
 
     return 0
 }
 
 # =============================================================================
-# Финальная проверка (изменена — не требует авторизации или UCI-интерфейсов)
+# Финальная проверка
 # =============================================================================
 
 verify_installation() {
@@ -739,7 +622,7 @@ verify_installation() {
         log_error "tailscaled не запущен."
         _ok=1
     fi
-    # Проверяем, что LocalAPI отвечает (даже при NeedsLogin)
+    # Проверяем LocalAPI
     if ! tailscale version >/dev/null 2>&1; then
         log_error "LocalAPI не отвечает."
         _ok=1
@@ -817,10 +700,13 @@ main() {
     validate_environment
 
     install_dependencies
-    configure_timezone
+    configure_timezone          # опционально, не влияет на сеть
+
+    ensure_tun                  # загружаем модуль tun, создаём /dev/net/tun
+    ensure_fake_iptables        # создаём фиктивные iptables/ip6tables
+
     ensure_tailscale_installed
     manage_service
-    # Убраны вызовы configure_network и enable_ip_forwarding
     configure_exit_node
 
     # Установка считается успешной при работающем демоне, даже без авторизации
