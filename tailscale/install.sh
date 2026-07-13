@@ -19,7 +19,7 @@ set -u
 #
 # Контракт артефактов:
 #   пакет tailscale, init /etc/init.d/tailscale
-#   UCI /etc/config/tailscale (fw_mode=off), network.tailscale
+#   UCI /etc/config/tailscale (fw_mode=off), network.tailscale (proto none)
 #   state: /etc/tailscale, /var/lib/tailscale, /var/run/tailscale
 #   kernel iface tailscale0
 #   firewall: zone tailscale, forwarding tailscale->wan, SSH/HTTP/HTTPS rules
@@ -38,7 +38,7 @@ readonly TAILSCALE_FW_MODE="off"
 readonly SYS_NET_PATH="/sys/class/net"
 
 readonly NET_INTERFACE="tailscale"
-readonly NET_PROTO="unmanaged"
+readonly NET_PROTO="none"
 
 readonly FW_ZONE="tailscale"
 readonly FW_ZONE_LEGACY="tailscaleZone"
@@ -431,25 +431,25 @@ phase_install_packages() {
 
 firewall_zone_index_by_name() {
     _zone_name="$1"
-    _idx=0
-    while uci -q get "firewall.@zone[${_idx}]" >/dev/null 2>&1; do
-        _name="$(uci -q get "firewall.@zone[${_idx}].name" 2>/dev/null || true)"
-        if [ "$_name" = "$_zone_name" ]; then
-            printf '%s' "$_idx"
+    _zone_idx=0
+    while uci -q get "firewall.@zone[${_zone_idx}]" >/dev/null 2>&1; do
+        _zone_cur="$(uci -q get "firewall.@zone[${_zone_idx}].name" 2>/dev/null || true)"
+        if [ "$_zone_cur" = "$_zone_name" ]; then
+            printf '%s' "$_zone_idx"
             return 0
         fi
-        _idx=$((_idx + 1))
+        _zone_idx=$((_zone_idx + 1))
     done
     return 1
 }
 
 firewall_anonymous_section_count() {
-    _type="$1"
-    _idx=0
-    while uci -q get "firewall.@${_type}[${_idx}]" >/dev/null 2>&1; do
-        _idx=$((_idx + 1))
+    _sec_type="$1"
+    _sec_idx=0
+    while uci -q get "firewall.@${_sec_type}[${_sec_idx}]" >/dev/null 2>&1; do
+        _sec_idx=$((_sec_idx + 1))
     done
-    printf '%s' "$_idx"
+    printf '%s' "$_sec_idx"
 }
 
 is_tailscale_zone_name() {
@@ -468,27 +468,27 @@ is_tailscale_rule_name() {
 }
 
 firewall_rule_exists() {
-    _rule_name="$1"
-    _idx=0
-    while uci -q get "firewall.@rule[${_idx}]" >/dev/null 2>&1; do
-        _name="$(uci -q get "firewall.@rule[${_idx}].name" 2>/dev/null || true)"
-        [ "$_name" = "$_rule_name" ] && return 0
-        _idx=$((_idx + 1))
+    _rule_chk="$1"
+    _rule_idx=0
+    while uci -q get "firewall.@rule[${_rule_idx}]" >/dev/null 2>&1; do
+        _rule_cur="$(uci -q get "firewall.@rule[${_rule_idx}].name" 2>/dev/null || true)"
+        [ "$_rule_cur" = "$_rule_chk" ] && return 0
+        _rule_idx=$((_rule_idx + 1))
     done
     return 1
 }
 
 firewall_forwarding_exists() {
-    _src="$1"
-    _dest="$2"
-    _idx=0
-    while uci -q get "firewall.@forwarding[${_idx}]" >/dev/null 2>&1; do
-        _f_src="$(uci -q get "firewall.@forwarding[${_idx}].src" 2>/dev/null || true)"
-        _f_dest="$(uci -q get "firewall.@forwarding[${_idx}].dest" 2>/dev/null || true)"
-        if [ "$_f_src" = "$_src" ] && [ "$_f_dest" = "$_dest" ]; then
+    _fwd_src="$1"
+    _fwd_dest="$2"
+    _fwd_idx=0
+    while uci -q get "firewall.@forwarding[${_fwd_idx}]" >/dev/null 2>&1; do
+        _fwd_cur_src="$(uci -q get "firewall.@forwarding[${_fwd_idx}].src" 2>/dev/null || true)"
+        _fwd_cur_dest="$(uci -q get "firewall.@forwarding[${_fwd_idx}].dest" 2>/dev/null || true)"
+        if [ "$_fwd_cur_src" = "$_fwd_src" ] && [ "$_fwd_cur_dest" = "$_fwd_dest" ]; then
             return 0
         fi
-        _idx=$((_idx + 1))
+        _fwd_idx=$((_fwd_idx + 1))
     done
     return 1
 }
@@ -549,39 +549,41 @@ clear_tailscale_state() {
 
 remove_uci_network_tailscale() {
     if uci -q get "network.${NET_INTERFACE}" >/dev/null 2>&1; then
+        uci -q delete "network.${NET_INTERFACE}.ipaddr" 2>/dev/null || true
+        uci -q delete "network.${NET_INTERFACE}.netmask" 2>/dev/null || true
         uci delete "network.${NET_INTERFACE}" || return 1
         log_info "Удалена секция network.${NET_INTERFACE}"
     fi
 }
 
 remove_uci_firewall_tailscale() {
-    _count="$(firewall_anonymous_section_count rule)"
-    _idx=$((_count - 1))
-    while [ "$_idx" -ge 0 ]; do
-        _name="$(uci -q get "firewall.@rule[${_idx}].name" 2>/dev/null || true)"
-        _src="$(uci -q get "firewall.@rule[${_idx}].src" 2>/dev/null || true)"
-        if is_tailscale_rule_name "$_name" || is_tailscale_zone_name "$_src"; then
-            uci delete "firewall.@rule[${_idx}]" || return 1
+    _rm_count="$(firewall_anonymous_section_count rule)"
+    _rm_idx=$((_rm_count - 1))
+    while [ "$_rm_idx" -ge 0 ]; do
+        _rm_name="$(uci -q get "firewall.@rule[${_rm_idx}].name" 2>/dev/null || true)"
+        _rm_src="$(uci -q get "firewall.@rule[${_rm_idx}].src" 2>/dev/null || true)"
+        if is_tailscale_rule_name "$_rm_name" || is_tailscale_zone_name "$_rm_src"; then
+            uci delete "firewall.@rule[${_rm_idx}]" || return 1
         fi
-        _idx=$((_idx - 1))
+        _rm_idx=$((_rm_idx - 1))
     done
 
-    _count="$(firewall_anonymous_section_count forwarding)"
-    _idx=$((_count - 1))
-    while [ "$_idx" -ge 0 ]; do
-        _src="$(uci -q get "firewall.@forwarding[${_idx}].src" 2>/dev/null || true)"
-        _dest="$(uci -q get "firewall.@forwarding[${_idx}].dest" 2>/dev/null || true)"
-        if is_tailscale_zone_name "$_src" || is_tailscale_zone_name "$_dest"; then
-            uci delete "firewall.@forwarding[${_idx}]" || return 1
+    _rm_count="$(firewall_anonymous_section_count forwarding)"
+    _rm_idx=$((_rm_count - 1))
+    while [ "$_rm_idx" -ge 0 ]; do
+        _rm_src="$(uci -q get "firewall.@forwarding[${_rm_idx}].src" 2>/dev/null || true)"
+        _rm_dest="$(uci -q get "firewall.@forwarding[${_rm_idx}].dest" 2>/dev/null || true)"
+        if is_tailscale_zone_name "$_rm_src" || is_tailscale_zone_name "$_rm_dest"; then
+            uci delete "firewall.@forwarding[${_rm_idx}]" || return 1
         fi
-        _idx=$((_idx - 1))
+        _rm_idx=$((_rm_idx - 1))
     done
 
-    for _zone in "$FW_ZONE" "$FW_ZONE_LEGACY"; do
-        _zidx="$(firewall_zone_index_by_name "$_zone" 2>/dev/null || true)"
-        while [ -n "$_zidx" ]; do
-            uci delete "firewall.@zone[${_zidx}]" || return 1
-            _zidx="$(firewall_zone_index_by_name "$_zone" 2>/dev/null || true)"
+    for _rm_zone in "$FW_ZONE" "$FW_ZONE_LEGACY"; do
+        _rm_zidx="$(firewall_zone_index_by_name "$_rm_zone" 2>/dev/null || true)"
+        while [ -n "$_rm_zidx" ]; do
+            uci delete "firewall.@zone[${_rm_zidx}]" || return 1
+            _rm_zidx="$(firewall_zone_index_by_name "$_rm_zone" 2>/dev/null || true)"
         done
     done
 }
@@ -679,45 +681,47 @@ configure_network_uci() {
     uci set "network.${NET_INTERFACE}=interface"
     uci set "network.${NET_INTERFACE}.proto=${NET_PROTO}"
     uci set "network.${NET_INTERFACE}.device=${TAILSCALE_IFACE}"
-    uci set "network.${NET_INTERFACE}.auto=1"
-    log_ok "UCI network.${NET_INTERFACE} создан."
+    uci -q delete "network.${NET_INTERFACE}.ipaddr" 2>/dev/null || true
+    uci -q delete "network.${NET_INTERFACE}.netmask" 2>/dev/null || true
+    uci -q delete "network.${NET_INTERFACE}.ip6assign" 2>/dev/null || true
+    log_ok "UCI network.${NET_INTERFACE} создан (proto=${NET_PROTO})."
 }
 
 add_firewall_rule_if_missing() {
-    _name="$1"
-    _port="$2"
-    if firewall_rule_exists "$_name"; then
-        log_info "Правило $_name уже существует."
+    _rule_name="$1"
+    _rule_port="$2"
+    if firewall_rule_exists "$_rule_name"; then
+        log_info "Правило $_rule_name уже существует."
         return 0
     fi
-    uci add firewall rule
-    uci set "firewall.@rule[-1].name=${_name}"
-    uci set "firewall.@rule[-1].src=${FW_ZONE}"
-    uci set "firewall.@rule[-1].proto=tcp"
-    uci set "firewall.@rule[-1].dest_port=${_port}"
-    uci set "firewall.@rule[-1].target=ACCEPT"
-    log_ok "Правило $_name добавлено (порт $_port)."
+    _rule_sec="$(uci add firewall rule)"
+    uci set "firewall.${_rule_sec}.name=${_rule_name}"
+    uci set "firewall.${_rule_sec}.src=${FW_ZONE}"
+    uci set "firewall.${_rule_sec}.proto=tcp"
+    uci set "firewall.${_rule_sec}.dest_port=${_rule_port}"
+    uci set "firewall.${_rule_sec}.target=ACCEPT"
+    log_ok "Правило $_rule_name добавлено (порт $_rule_port)."
 }
 
 configure_firewall_uci() {
     if ! firewall_zone_index_by_name "$FW_ZONE" >/dev/null 2>&1; then
-        uci add firewall zone
-        uci set "firewall.@zone[-1].name=${FW_ZONE}"
-        uci set "firewall.@zone[-1].input=ACCEPT"
-        uci set "firewall.@zone[-1].output=ACCEPT"
-        uci set "firewall.@zone[-1].forward=ACCEPT"
-        uci set "firewall.@zone[-1].masq=1"
-        uci set "firewall.@zone[-1].mtu_fix=1"
-        uci add_list "firewall.@zone[-1].network=${NET_INTERFACE}"
+        _zone_sec="$(uci add firewall zone)"
+        uci set "firewall.${_zone_sec}.name=${FW_ZONE}"
+        uci set "firewall.${_zone_sec}.input=ACCEPT"
+        uci set "firewall.${_zone_sec}.output=ACCEPT"
+        uci set "firewall.${_zone_sec}.forward=ACCEPT"
+        uci set "firewall.${_zone_sec}.masq=1"
+        uci set "firewall.${_zone_sec}.mtu_fix=1"
+        uci add_list "firewall.${_zone_sec}.network=${NET_INTERFACE}"
         log_ok "Firewall-зона ${FW_ZONE} создана."
     else
         log_info "Firewall-зона ${FW_ZONE} уже существует."
     fi
 
     if ! firewall_forwarding_exists "$FW_ZONE" "$FW_WAN_ZONE"; then
-        uci add firewall forwarding
-        uci set "firewall.@forwarding[-1].src=${FW_ZONE}"
-        uci set "firewall.@forwarding[-1].dest=${FW_WAN_ZONE}"
+        _fwd_sec="$(uci add firewall forwarding)"
+        uci set "firewall.${_fwd_sec}.src=${FW_ZONE}"
+        uci set "firewall.${_fwd_sec}.dest=${FW_WAN_ZONE}"
         log_ok "Forwarding ${FW_ZONE} -> ${FW_WAN_ZONE} добавлен."
     fi
 
@@ -745,14 +749,10 @@ uci_commit_and_reload() {
 }
 
 sync_tailscale_ip_to_uci() {
-    _ip="$(tailscale ip -4 2>/dev/null || true)"
-    [ -z "$_ip" ] && return 0
-    uci set "network.${NET_INTERFACE}.proto=static"
-    uci set "network.${NET_INTERFACE}.ipaddr=${_ip}"
-    uci set "network.${NET_INTERFACE}.netmask=255.255.255.255"
-    uci commit network || return 1
-    /etc/init.d/network reload 2>/dev/null || true
-    log_ok "Tailscale IP в LuCI: ${_ip}"
+    _ts_ip="$(tailscale ip -4 2>/dev/null || true)"
+    [ -z "$_ts_ip" ] && return 0
+    # IP назначает tailscaled; не переводим UCI в proto=static — это ломает маршрутизацию WAN.
+    log_info "Tailscale IPv4: ${_ts_ip} (интерфейс в LuCI: network.${NET_INTERFACE}, proto=${NET_PROTO})"
 }
 
 phase_configure_service() {
