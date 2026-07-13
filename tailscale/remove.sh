@@ -8,6 +8,8 @@
 #
 # Совместимость: BusyBox ash (/bin/sh), opkg (24.x), apk (25.x)
 #
+# Обновлён для совместимости с новым установщиком (поддержка зеркал, таймаутов и т.д.)
+#
 
 set -u
 
@@ -117,6 +119,7 @@ is_tailscale_zone_name() {
     esac
 }
 
+# Проверяем, что имя правила начинается с "Allow-Tailscale-" (все наши правила)
 is_tailscale_rule_name() {
     case "$1" in
         Allow-Tailscale-*) return 0 ;;
