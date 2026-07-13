@@ -26,6 +26,13 @@ readonly DAEMON_WAIT_SECS=30
 readonly DAEMON_POLL_SECS=2
 readonly TAILSCALE_UP_TIMEOUT=15   # секунд ожидания при отсутствии ключа
 
+readonly TAILSCALE_IFACE="tailscale0"
+readonly IFACE_WAIT_SECS=10
+readonly IFACE_BIND_WAIT_SECS=2
+readonly IFACE_RETRY_WAIT_SECS=3
+readonly TAILSCALE_UP_LOG="/tmp/tailscale_up.log"
+readonly TAILSCALE_UP_MAX_ATTEMPTS=2
+
 readonly OPENWRT_RELEASE_FILE="/etc/openwrt_release"
 
 # Настройки времени (опционально)
@@ -126,6 +133,14 @@ is_process_running() {
         ps -w | grep -v grep | grep -q "[${_name%?}]${_name#?}" && return 0
     fi
     return 1
+}
+
+interface_exists() {
+    ip link show "$TAILSCALE_IFACE" >/dev/null 2>&1
+}
+
+interface_is_up() {
+    interface_exists && ip link show "$TAILSCALE_IFACE" 2>/dev/null | grep -q 'state UP\|state UNKNOWN'
 }
 
 read_openwrt_var() {
@@ -534,6 +549,58 @@ manage_service() {
     enable_service
     start_service
     wait_for_daemon_ready || die "Tailscaled не запущен."
+    ensure_tailscale_interface || log_warn "Не удалось создать интерфейс ${TAILSCALE_IFACE}, возможны проблемы с авторизацией."
+    check_daemon_status || die "Проверка статуса tailscaled не пройдена."
+}
+
+# =============================================================================
+# Интерфейс tailscale0
+# =============================================================================
+
+ensure_tailscale_interface() {
+    _elapsed=0
+
+    log_info "Проверка наличия интерфейса ${TAILSCALE_IFACE}..."
+
+    while [ "$_elapsed" -lt "$IFACE_WAIT_SECS" ]; do
+        if interface_is_up; then
+            log_ok "Интерфейс ${TAILSCALE_IFACE} уже существует."
+            return 0
+        fi
+        if interface_exists; then
+            log_info "Интерфейс ${TAILSCALE_IFACE} найден, но не поднят — поднимаем..."
+            ip link set "$TAILSCALE_IFACE" up 2>/dev/null && {
+                log_ok "Интерфейс ${TAILSCALE_IFACE} поднят."
+                sleep "$IFACE_BIND_WAIT_SECS"
+                return 0
+            }
+        fi
+        sleep 1
+        _elapsed=$((_elapsed + 1))
+    done
+
+    log_warn "Интерфейс ${TAILSCALE_IFACE} не появился за ${IFACE_WAIT_SECS} с. Создаём вручную..."
+
+    if interface_exists; then
+        ip link set "$TAILSCALE_IFACE" up 2>/dev/null || {
+            log_error "Не удалось поднять интерфейс ${TAILSCALE_IFACE}."
+            return 1
+        }
+    else
+        ip tuntap add mode tun dev "$TAILSCALE_IFACE" 2>/dev/null || {
+            log_error "Не удалось создать интерфейс через ip tuntap. Проверьте поддержку TUN."
+            return 1
+        }
+        ip link set "$TAILSCALE_IFACE" up 2>/dev/null || {
+            log_error "Не удалось поднять интерфейс ${TAILSCALE_IFACE}."
+            return 1
+        }
+    fi
+
+    log_ok "Интерфейс ${TAILSCALE_IFACE} создан и поднят."
+    log_info "Ожидание привязки демона к интерфейсу (${IFACE_BIND_WAIT_SECS} с)..."
+    sleep "$IFACE_BIND_WAIT_SECS"
+    return 0
 }
 
 # =============================================================================
@@ -541,72 +608,159 @@ manage_service() {
 # =============================================================================
 
 is_tailscale_authenticated() {
-    tailscale ip -4 >/dev/null 2>&1 && [ -f "/var/lib/tailscale/tailscaled.state" ]
-    return $?
+    _status=""
+
+    _status="$(tailscale status 2>&1 || true)"
+
+    if printf '%s\n' "$_status" | grep -qi 'logged out'; then
+        return 1
+    fi
+
+    if printf '%s\n' "$_status" | grep -qi 'needs login'; then
+        return 1
+    fi
+
+    if printf '%s\n' "$_status" | grep -q 'https://login.tailscale.com/'; then
+        return 1
+    fi
+
+    tailscale ip -4 >/dev/null 2>&1
+}
+
+build_tailscale_up_command() {
+    _cmd="tailscale up"
+
+    if [ -n "$AUTH_KEY" ]; then
+        _cmd="$_cmd --auth-key=$AUTH_KEY"
+    fi
+
+    # shellcheck disable=SC2086
+    _cmd="$_cmd $TAILSCALE_UP_ARGS"
+    printf '%s' "$_cmd"
+}
+
+run_tailscale_up() {
+    _use_timeout="$1"
+    _cmd="$(build_tailscale_up_command)"
+    _ret=0
+
+    : > "$TAILSCALE_UP_LOG"
+    log_info "Выполнение: $_cmd"
+
+    if [ "$_use_timeout" -eq 1 ] && [ -z "$AUTH_KEY" ]; then
+        run_with_timeout "$TAILSCALE_UP_TIMEOUT" sh -c "$_cmd" >> "$TAILSCALE_UP_LOG" 2>&1
+        _ret=$?
+        if [ "$_ret" -eq 124 ]; then
+            log_warn "tailscale up не завершился за ${TAILSCALE_UP_TIMEOUT} с (таймаут)."
+        elif [ "$_ret" -ne 0 ]; then
+            log_warn "tailscale up завершился с кодом $_ret."
+        fi
+    else
+        sh -c "$_cmd" >> "$TAILSCALE_UP_LOG" 2>&1
+        _ret=$?
+        if [ "$_ret" -ne 0 ]; then
+            log_warn "tailscale up завершился с кодом $_ret."
+        fi
+    fi
+
+    if [ -s "$TAILSCALE_UP_LOG" ]; then
+        cat "$TAILSCALE_UP_LOG"
+    fi
+
+    return "$_ret"
+}
+
+extract_login_url_from_sources() {
+    _url=""
+    _status=""
+
+    _url="$(grep -o 'https://login.tailscale.com/[^ ]*' "$TAILSCALE_UP_LOG" 2>/dev/null | head -n 1)"
+    if [ -n "$_url" ]; then
+        printf '%s' "$_url"
+        return 0
+    fi
+
+    _status="$(tailscale status 2>&1 || true)"
+    _url="$(printf '%s\n' "$_status" | grep -o 'https://login.tailscale.com/[^ ]*' | head -n 1)"
+    if [ -n "$_url" ]; then
+        printf '%s' "$_url"
+        return 0
+    fi
+
+    if have_cmd logread; then
+        _url="$(logread 2>/dev/null | grep 'login.tailscale.com' | grep -o 'https://login.tailscale.com/[^ ]*' | tail -n 1)"
+        if [ -n "$_url" ]; then
+            printf '%s' "$_url"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+print_login_instructions() {
+    _cmd="$(build_tailscale_up_command)"
+
+    if _url="$(extract_login_url_from_sources)"; then
+        printf '\n'
+        log_info "Для завершения авторизации перейдите по ссылке:"
+        printf '    %s\n\n' "$_url"
+        log_info "После входа включите Exit Node: https://login.tailscale.com/admin/machines"
+        return 0
+    fi
+
+    log_warn "Не удалось получить ссылку для входа. Выполните вручную:"
+    printf '    %s\n' "$_cmd"
+
+    if [ -f "$TAILSCALE_UP_LOG" ]; then
+        log_info "Последние строки лога:"
+        tail -n 5 "$TAILSCALE_UP_LOG" >&2
+    fi
+
+    return 1
 }
 
 configure_exit_node() {
     log_step "Настройка Exit Node"
 
-    # Если уже авторизован, пропускаем
     if is_tailscale_authenticated; then
         log_ok "Tailscale уже авторизован (IPv4: $(tailscale ip -4 2>/dev/null)). Пропускаем 'tailscale up'."
         return 0
     fi
 
-    _cmd="tailscale up"
     if [ -n "$AUTH_KEY" ]; then
-        _cmd="$_cmd --auth-key=$AUTH_KEY"
         log_info "Используется ключ авторизации."
     fi
-    _cmd="$_cmd $TAILSCALE_UP_ARGS"
 
-    log_info "Выполнение: $_cmd"
+    _attempt=0
+    while [ "$_attempt" -lt "$TAILSCALE_UP_MAX_ATTEMPTS" ]; do
+        _attempt=$((_attempt + 1))
+        log_info "Попытка авторизации #${_attempt} из ${TAILSCALE_UP_MAX_ATTEMPTS}..."
 
-    # Сохраняем вывод в лог-файл
-    _log="/tmp/tailscale_up.log"
-    > "$_log"
-
-    if [ -n "$AUTH_KEY" ]; then
-        # Без таймаута — ждём завершения
-        sh -c "$_cmd" > "$_log" 2>&1
-        _ret=$?
-        cat "$_log"
-        if [ $_ret -ne 0 ]; then
-            log_warn "tailscale up с ключом завершился с кодом $_ret."
+        if [ "$_attempt" -eq 1 ] && [ -z "$AUTH_KEY" ]; then
+            run_tailscale_up 1
+        else
+            run_tailscale_up 0
         fi
-    else
-        # С таймаутом
-        run_with_timeout "$TAILSCALE_UP_TIMEOUT" sh -c "$_cmd" > "$_log" 2>&1
-        _ret=$?
-        cat "$_log"
-        if [ $_ret -eq 124 ]; then
-            log_warn "Команда tailscale up не завершилась за ${TAILSCALE_UP_TIMEOUT} сек (таймаут)."
-        elif [ $_ret -ne 0 ]; then
-            log_warn "tailscale up завершился с кодом $_ret."
+
+        if is_tailscale_authenticated; then
+            log_ok "Tailscale успешно авторизован."
+            return 0
         fi
-    fi
 
-    # Проверяем успешность авторизации
-    if is_tailscale_authenticated; then
-        log_ok "Tailscale успешно авторизован."
-        return 0
-    fi
+        if ! interface_exists; then
+            log_warn "Интерфейс ${TAILSCALE_IFACE} отсутствует — создаём..."
+            ensure_tailscale_interface || log_warn "Не удалось создать интерфейс ${TAILSCALE_IFACE}."
+            log_info "Ожидание перед повторной попыткой (${IFACE_RETRY_WAIT_SECS} с)..."
+            sleep "$IFACE_RETRY_WAIT_SECS"
+        elif [ "$_attempt" -lt "$TAILSCALE_UP_MAX_ATTEMPTS" ]; then
+            log_info "Интерфейс ${TAILSCALE_IFACE} присутствует — повторяем tailscale up без таймаута..."
+        fi
 
-    # Если не авторизованы – извлекаем ссылку
-    _url="$(grep -o 'https://login.tailscale.com/[^ ]*' "$_log" 2>/dev/null | head -n1)"
-    if [ -n "$_url" ]; then
-        printf '\n'
-        log_info "Для завершения авторизации перейдите по ссылке:"
-        printf '    %s\n\n' "$_url"
-        log_info "После входа выполните 'tailscale up' вручную или перезапустите скрипт с ключом."
-    else
-        log_warn "Не удалось получить ссылку для входа. Попробуйте выполнить вручную:"
-        printf '    %s\n' "$_cmd"
-        # Выведем последние строки лога для диагностики
-        log_info "Последние строки лога:"
-        tail -n 5 "$_log" >&2
-    fi
+        if [ "$_attempt" -eq "$TAILSCALE_UP_MAX_ATTEMPTS" ]; then
+            print_login_instructions
+        fi
+    done
 
     return 0
 }
@@ -622,7 +776,9 @@ verify_installation() {
         log_error "tailscaled не запущен."
         _ok=1
     fi
-    # Проверяем LocalAPI
+    if ! interface_exists; then
+        log_warn "Интерфейс ${TAILSCALE_IFACE} не найден."
+    fi
     if ! tailscale version >/dev/null 2>&1; then
         log_error "LocalAPI не отвечает."
         _ok=1
@@ -651,11 +807,14 @@ print_final_report() {
     is_tailscale_authenticated && _auth="авторизовано"
     _state="остановлен"
     is_process_running tailscaled && _state="работает"
+    _iface="отсутствует"
+    interface_exists && _iface="создан"
     _ts_ip="$(tailscale ip -4 2>/dev/null || true)"
 
     printf '\n=========================================\n Установка Tailscale завершена\n=========================================\n\n'
     log_ok "Пакет          : установлен"
     log_ok "Сервис         : ${_state}"
+    log_ok "Интерфейс      : ${_iface} (${TAILSCALE_IFACE})"
     log_ok "Авторизация    : ${_auth}"
     log_info "Exit Node      : объявлен (${TAILSCALE_UP_ARGS})"
     [ -n "$_ts_ip" ] && log_info "Tailscale IPv4 : ${_ts_ip}"
