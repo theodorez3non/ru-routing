@@ -21,7 +21,7 @@ readonly TAILSCALE_INIT_DEFAULT="/etc/init.d/tailscale"
 readonly TAILSCALE_UP_ARGS="--advertise-exit-node --accept-dns=false --netfilter-mode=off --ssh"
 
 readonly DEP_PACKAGES="kmod-tun ca-bundle"
-readonly OPTIONAL_PACKAGES="iptables-nft"
+readonly OPTIONAL_PACKAGES="iptables-nft ip6tables-nft"
 readonly MIN_FREE_KIB=10240
 readonly DAEMON_WAIT_SECS=30
 readonly DAEMON_POLL_SECS=2
@@ -396,16 +396,38 @@ ensure_tun() {
 # Netfilter и конфигурация демона
 # =============================================================================
 
+netfilter_tool_available() {
+    _tool="$1"
+    if have_cmd "$_tool"; then
+        return 0
+    fi
+    if [ -x "/usr/sbin/$_tool" ]; then
+        return 0
+    fi
+    return 1
+}
+
 ensure_netfilter_tools() {
     log_step "Проверка netfilter"
 
-    if have_cmd iptables && have_cmd ip6tables; then
+    if netfilter_tool_available iptables && netfilter_tool_available ip6tables; then
         log_ok "iptables/ip6tables доступны."
         return 0
     fi
 
-    log_warn "iptables/ip6tables не найдены — пробуем установить iptables-nft..."
+    log_warn "iptables/ip6tables не найдены — пробуем установить iptables-nft и ip6tables-nft..."
     install_optional_packages
+
+    if netfilter_tool_available iptables && netfilter_tool_available ip6tables; then
+        log_ok "iptables/ip6tables установлены."
+        return 0
+    fi
+
+    if netfilter_tool_available iptables; then
+        log_warn "ip6tables недоступен. tailscaled --cleanup может выдавать предупреждения."
+    else
+        log_warn "iptables недоступен. При fw_mode=off это не критично."
+    fi
 }
 
 configure_tailscale_daemon() {
@@ -701,14 +723,15 @@ is_tailscale_authenticated() {
 }
 
 build_tailscale_up_command() {
-    _cmd="tailscale up"
+    _timeout_flag="$TAILSCALE_UP_TIMEOUT"
+    if [ -n "$AUTH_KEY" ]; then
+        _timeout_flag="$TAILSCALE_UP_AUTH_TIMEOUT"
+    fi
+
+    _cmd="tailscale up --reset --timeout=${_timeout_flag}s"
 
     if [ -n "$AUTH_KEY" ]; then
         _cmd="$_cmd --auth-key=$AUTH_KEY"
-    fi
-
-    if is_mips_platform; then
-        _cmd="$_cmd --tun=$TAILSCALE_IFACE"
     fi
 
     # shellcheck disable=SC2086
@@ -740,6 +763,12 @@ run_tailscale_up() {
         fi
     elif [ "$_ret" -ne 0 ]; then
         log_warn "tailscale up #${_attempt_no} завершился с кодом $_ret."
+        if grep -q 'flag provided but not defined' "$TAILSCALE_UP_LOG" 2>/dev/null; then
+            log_error "Неверный аргумент tailscale up. Проверьте команду в логе выше."
+        fi
+        if grep -qi 'invalid auth key\|auth key expired\|unable to authenticate' "$TAILSCALE_UP_LOG" 2>/dev/null; then
+            log_error "Проблема с ключом авторизации. Создайте новый ключ в админке Tailscale."
+        fi
     fi
 
     if [ -s "$TAILSCALE_UP_LOG" ]; then
@@ -826,8 +855,16 @@ configure_exit_node() {
         run_tailscale_up "$_attempt"
 
         if is_tailscale_authenticated; then
-            log_ok "Tailscale успешно авторизован."
+            log_ok "Tailscale успешно авторизован (IPv4: $(tailscale ip -4 2>/dev/null))."
             return 0
+        fi
+
+        if interface_is_operational; then
+            log_info "Интерфейс ${TAILSCALE_IFACE} работает — ожидается успешный tailscale up."
+        elif interface_exists; then
+            log_warn "Интерфейс ${TAILSCALE_IFACE} существует, но не в состоянии UP."
+        else
+            log_warn "Интерфейс ${TAILSCALE_IFACE} отсутствует."
         fi
 
         if [ "$_attempt" -lt "$TAILSCALE_UP_MAX_ATTEMPTS" ]; then
