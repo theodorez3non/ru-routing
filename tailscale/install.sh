@@ -7,7 +7,7 @@
 #   2. Повторный запуск — пакеты не трогаются, сервис сбрасывается и настраивается заново.
 #
 # Использование:
-#   sh install.sh [--mirror <URL>] [--auth-key <ключ>]
+#   sh install.sh [--mirror <URL>]
 #
 # Совместимость: BusyBox ash (/bin/sh), opkg (24.x), apk (25.x)
 #
@@ -68,11 +68,8 @@ readonly PROCESS_STOP_WAIT_SECS=2
 
 readonly IFACE_WAIT_SECS=10
 readonly IFACE_BIND_WAIT_SECS=3
-readonly IFACE_RETRY_WAIT_SECS=5
 
-readonly TAILSCALE_UP_TIMEOUT=15
-readonly TAILSCALE_UP_AUTH_WAIT_SECS=300
-readonly TAILSCALE_UP_MAX_ATTEMPTS=2
+readonly TAILSCALE_UP_HINT_TIMEOUT="60s"
 
 readonly OPENWRT_RELEASE_FILE="/etc/openwrt_release"
 readonly TIMEZONE_NAME="Europe/Moscow"
@@ -91,7 +88,6 @@ REPO_FILE=""
 INSTALL_MODE="reconfigure"
 
 MIRROR_URL=""
-AUTH_KEY=""
 
 # =============================================================================
 # Цвета
@@ -140,30 +136,6 @@ read_openwrt_var() {
     _var="$1"
     [ -f "$OPENWRT_RELEASE_FILE" ] || return 0
     grep "^${_var}=" "$OPENWRT_RELEASE_FILE" 2>/dev/null | head -n 1 | cut -d= -f2- | tr -d "'\""
-}
-
-run_with_timeout() {
-    _timeout="$1"
-    shift
-    if have_cmd timeout; then
-        timeout "$_timeout" "$@"
-        return $?
-    fi
-    "$@" &
-    _pid=$!
-    _elapsed=0
-    while [ "$_elapsed" -lt "$_timeout" ]; do
-        sleep 1
-        _elapsed=$((_elapsed + 1))
-        kill -0 "$_pid" 2>/dev/null || break
-    done
-    if kill -0 "$_pid" 2>/dev/null; then
-        kill "$_pid" 2>/dev/null
-        wait "$_pid" 2>/dev/null
-        return 124
-    fi
-    wait "$_pid" 2>/dev/null
-    return $?
 }
 
 is_process_running() {
@@ -748,13 +720,6 @@ uci_commit_and_reload() {
     /etc/init.d/firewall reload 2>/dev/null || log_warn "firewall reload warning."
 }
 
-sync_tailscale_ip_to_uci() {
-    _ts_ip="$(tailscale ip -4 2>/dev/null || true)"
-    [ -z "$_ts_ip" ] && return 0
-    # IP назначает tailscaled; не переводим UCI в proto=static — это ломает маршрутизацию WAN.
-    log_info "Tailscale IPv4: ${_ts_ip} (интерфейс в LuCI: network.${NET_INTERFACE}, proto=${NET_PROTO})"
-}
-
 phase_configure_service() {
     log_step "Фаза 3: настройка сервиса Tailscale"
 
@@ -783,7 +748,7 @@ phase_configure_service() {
 }
 
 # =============================================================================
-# Фаза 4: авторизация и Exit Node
+# Фаза 4: подсказка для авторизации (вручную)
 # =============================================================================
 
 is_tailscale_authenticated() {
@@ -795,116 +760,18 @@ is_tailscale_authenticated() {
 }
 
 build_tailscale_up_command() {
-    _cmd="tailscale up --reset"
-    if [ -n "$AUTH_KEY" ]; then
-        _cmd="$_cmd --auth-key=$AUTH_KEY"
-    else
-        _cmd="$_cmd --timeout=30s"
-    fi
     # shellcheck disable=SC2086
-    _cmd="$_cmd $TAILSCALE_UP_ARGS"
-    printf '%s' "$_cmd"
+    printf 'tailscale up --reset --timeout=%s %s' "$TAILSCALE_UP_HINT_TIMEOUT" "$TAILSCALE_UP_ARGS"
 }
 
-run_tailscale_up() {
-    _attempt_no="$1"
-    _cmd="$(build_tailscale_up_command)"
-    _ret=0
-    _elapsed=0
-
-    : > "$TAILSCALE_UP_LOG"
-
-    if [ -n "$AUTH_KEY" ]; then
-        log_info "Регистрация по ключу (до ${TAILSCALE_UP_AUTH_WAIT_SECS} с): $_cmd"
-        sh -c "$_cmd" >> "$TAILSCALE_UP_LOG" 2>&1 &
-        _pid=$!
-        while [ "$_elapsed" -lt "$TAILSCALE_UP_AUTH_WAIT_SECS" ]; do
-            if is_tailscale_authenticated; then
-                log_ok "Авторизация завершена за ${_elapsed} с."
-                kill "$_pid" 2>/dev/null || true
-                wait "$_pid" 2>/dev/null || true
-                return 0
-            fi
-            if ! kill -0 "$_pid" 2>/dev/null; then
-                wait "$_pid"
-                _ret=$?
-                break
-            fi
-            sleep 2
-            _elapsed=$((_elapsed + 2))
-        done
-        if kill -0 "$_pid" 2>/dev/null; then
-            kill "$_pid" 2>/dev/null || true
-            wait "$_pid" 2>/dev/null || true
-            is_tailscale_authenticated && return 0
-            _ret=124
-            log_warn "Регистрация не завершилась за ${TAILSCALE_UP_AUTH_WAIT_SECS} с."
-        fi
-    else
-        log_info "Выполнение (таймаут ${TAILSCALE_UP_TIMEOUT} с): $_cmd"
-        run_with_timeout "$TAILSCALE_UP_TIMEOUT" sh -c "$_cmd" >> "$TAILSCALE_UP_LOG" 2>&1
-        _ret=$?
-    fi
-
-    if [ -s "$TAILSCALE_UP_LOG" ]; then
-        cat "$TAILSCALE_UP_LOG"
-    fi
-    log_interface_state
-    return "$_ret"
-}
-
-extract_login_url() {
-    _url="$(grep -o 'https://login.tailscale.com/[^ ]*' "$TAILSCALE_UP_LOG" 2>/dev/null | head -n 1)"
-    [ -n "$_url" ] && { printf '%s' "$_url"; return 0; }
-    _status="$(tailscale status 2>&1 || true)"
-    _url="$(printf '%s\n' "$_status" | grep -o 'https://login.tailscale.com/[^ ]*' | head -n 1)"
-    [ -n "$_url" ] && { printf '%s' "$_url"; return 0; }
-    return 1
-}
-
-print_login_instructions() {
-    _cmd="$(build_tailscale_up_command)"
-    if _url="$(extract_login_url)"; then
-        printf '\n'
-        log_info "Для авторизации перейдите по ссылке:"
-        printf '    %s\n\n' "$_url"
-        return 0
-    fi
-    log_warn "Ссылка не найдена. Выполните вручную:"
-    printf '    %s\n' "$_cmd"
-}
-
-phase_auth_exit_node() {
+print_tailscale_login_hint() {
+    _up_cmd="$(build_tailscale_up_command)"
     log_step "Фаза 4: авторизация и Exit Node"
-
-    if is_tailscale_authenticated; then
-        log_ok "Уже авторизован (IPv4: $(tailscale ip -4 2>/dev/null))."
-        sync_tailscale_ip_to_uci
-        return 0
-    fi
-
-    _attempt=0
-    while [ "$_attempt" -lt "$TAILSCALE_UP_MAX_ATTEMPTS" ]; do
-        _attempt=$((_attempt + 1))
-        log_info "Попытка #${_attempt} из ${TAILSCALE_UP_MAX_ATTEMPTS}..."
-
-        if ! interface_is_operational; then
-            ensure_tailscale_interface || log_warn "Интерфейс не готов."
-            sleep "$IFACE_RETRY_WAIT_SECS"
-        fi
-
-        run_tailscale_up "$_attempt"
-
-        if is_tailscale_authenticated; then
-            log_ok "Tailscale авторизован (IPv4: $(tailscale ip -4 2>/dev/null))."
-            sync_tailscale_ip_to_uci
-            return 0
-        fi
-
-        if [ "$_attempt" -eq "$TAILSCALE_UP_MAX_ATTEMPTS" ]; then
-            print_login_instructions
-        fi
-    done
+    printf '\n'
+    log_info "Скрипт не запускает tailscale up автоматически."
+    log_info "Для входа в сеть и включения Exit Node выполните:"
+    printf '\n    %s\n\n' "$_up_cmd"
+    log_info "Затем откройте ссылку из вывода команды или проверьте: tailscale status"
 }
 
 # =============================================================================
@@ -930,15 +797,19 @@ print_final_report() {
     _state="остановлен"
     is_process_running tailscaled && _state="работает"
     _ts_ip="$(tailscale ip -4 2>/dev/null || true)"
+    _up_cmd="$(build_tailscale_up_command)"
 
     printf '\n=========================================\n Установка Tailscale завершена\n=========================================\n\n'
     log_ok "Режим          : ${INSTALL_MODE}"
     log_ok "Сервис         : ${_state}"
     log_ok "Интерфейс      : ${TAILSCALE_IFACE}"
     log_ok "LuCI           : network.${NET_INTERFACE}"
-    log_ok "Авторизация    : ${_auth}"
+    log_info "Авторизация    : ${_auth} (выполняется вручную)"
     log_info "Exit Node      : ${TAILSCALE_UP_ARGS}"
     [ -n "$_ts_ip" ] && log_info "Tailscale IPv4 : ${_ts_ip}"
+    printf '\n'
+    log_info "Команда для входа в сеть:"
+    printf '    %s\n' "$_up_cmd"
     printf '\n'
     log_info "Статус: tailscale status"
     log_info "Админка: https://login.tailscale.com/admin/machines"
@@ -955,11 +826,6 @@ main() {
             --mirror)
                 [ -n "$2" ] || die "Ошибка: --mirror требует URL."
                 MIRROR_URL="$2"
-                shift 2
-                ;;
-            --auth-key)
-                [ -n "$2" ] || die "Ошибка: --auth-key требует ключ."
-                AUTH_KEY="$2"
                 shift 2
                 ;;
             *) die "Неизвестный аргумент: $1" ;;
@@ -982,7 +848,7 @@ main() {
     phase_install_packages
     phase_reset_service
     phase_configure_service
-    phase_auth_exit_node
+    print_tailscale_login_hint
     print_final_report
 }
 
