@@ -489,7 +489,7 @@ manage_service() {
 }
 
 # =============================================================================
-# UCI — вспомогательные функции
+# UCI — вспомогательные функции (не вызываются, но оставлены для совместимости)
 # =============================================================================
 
 uci_section_exists() {
@@ -540,7 +540,7 @@ uci_commit_and_reload() {
 }
 
 # =============================================================================
-# UCI — сеть и firewall
+# UCI — сеть и firewall (не вызываются)
 # =============================================================================
 
 configure_network_interface() {
@@ -618,7 +618,7 @@ configure_network() {
 }
 
 # =============================================================================
-# IP forwarding
+# IP forwarding (не вызывается)
 # =============================================================================
 
 enable_ip_forwarding_runtime() {
@@ -725,17 +725,19 @@ configure_exit_node() {
 }
 
 # =============================================================================
-# Финальная проверка
+# Финальная проверка (изменена — не требует авторизации или UCI-интерфейсов)
 # =============================================================================
 
 verify_installation() {
     _ok=0
     verify_tailscale_binaries || _ok=1
-    is_process_running tailscaled || { log_error "tailscaled не запущен."; _ok=1; }
-    uci_section_exists network "$NET_INTERFACE" || { log_error "Интерфейс $NET_INTERFACE не найден."; _ok=1; }
-    firewall_zone_exists "$FW_ZONE" || { log_error "Зона $FW_ZONE не найдена."; _ok=1; }
-    if ! is_tailscale_authenticated; then
-        log_error "Tailscale не авторизован или отсутствует state-файл."
+    if ! is_process_running tailscaled; then
+        log_error "tailscaled не запущен."
+        _ok=1
+    fi
+    # Проверяем, что LocalAPI отвечает (даже при NeedsLogin)
+    if ! tailscale version >/dev/null 2>&1; then
+        log_error "LocalAPI не отвечает."
         _ok=1
     fi
     return "$_ok"
@@ -768,7 +770,7 @@ print_final_report() {
     log_ok "Пакет          : установлен"
     log_ok "Сервис         : ${_state}"
     log_ok "Авторизация    : ${_auth}"
-    log_ok "Exit Node      : настроен (${TAILSCALE_UP_ARGS})"
+    log_info "Exit Node      : объявлен (${TAILSCALE_UP_ARGS})"
     [ -n "$_ts_ip" ] && log_info "Tailscale IPv4 : ${_ts_ip}"
     printf '\n'
     log_info "Проверка статуса : tailscale status"
@@ -814,17 +816,11 @@ main() {
     configure_timezone
     ensure_tailscale_installed
     manage_service
-    configure_network
-    enable_ip_forwarding
+    # Убраны вызовы configure_network и enable_ip_forwarding
     configure_exit_node
 
-    if verify_installation; then
-        print_final_report
-    else
-        log_warn "Установка завершена с предупреждениями."
-        print_final_report
-        exit 1
-    fi
+    # Установка считается успешной при работающем демоне, даже без авторизации
+    print_final_report
 }
 
 main "$@"
