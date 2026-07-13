@@ -1,8 +1,8 @@
 #!/bin/sh
 #
 # Tailscale Exit Node — production installer for OpenWrt 24.x / 25.x
-# Безопасная установка: не изменяет DNS, firewall, маршруты, интерфейсы UCI.
-# Поддерживает авторизацию по ключу или интерактивно (вывод ссылки).
+# Идемпотентная установка: повторный запуск настраивает сервис заново,
+# не переустанавливая уже установленные пакеты.
 #
 # Использование:
 #   sh install.sh [--mirror <URL>] [--auth-key <ключ>]
@@ -14,11 +14,14 @@ set -u
 # Константы
 # =============================================================================
 
-readonly SCRIPT_TITLE="Tailscale installer for OpenWrt (non‑invasive)"
+readonly SCRIPT_TITLE="Tailscale installer for OpenWrt"
 
 readonly TAILSCALE_PKG="tailscale"
 readonly TAILSCALE_INIT_DEFAULT="/etc/init.d/tailscale"
 readonly TAILSCALE_UP_ARGS="--advertise-exit-node --accept-dns=false --netfilter-mode=off --ssh"
+
+readonly NET_INTERFACE="tailscale"
+readonly NET_PROTO="unmanaged"
 
 readonly DEP_PACKAGES="kmod-tun ca-bundle"
 readonly OPTIONAL_PACKAGES="iptables-nft ip6tables-nft"
@@ -26,7 +29,7 @@ readonly MIN_FREE_KIB=10240
 readonly DAEMON_WAIT_SECS=30
 readonly DAEMON_POLL_SECS=2
 readonly TAILSCALE_UP_TIMEOUT=15
-readonly TAILSCALE_UP_AUTH_TIMEOUT=120
+readonly TAILSCALE_UP_AUTH_WAIT_SECS=300
 
 readonly TAILSCALE_IFACE="tailscale0"
 readonly TAILSCALE_UCI_CONFIG="/etc/config/tailscale"
@@ -279,10 +282,35 @@ pm_update_indexes() {
 pm_is_installed() {
     _pkg="$1"
     case "$SYS_PM" in
-        apk) apk info -e "$_pkg" >/dev/null 2>&1 ;;
-        opkg) opkg status "$_pkg" 2>/dev/null | grep -q '^Status: install' ;;
-        *) return 1 ;;
+        apk)
+            if apk info -e "$_pkg" >/dev/null 2>&1; then
+                return 0
+            fi
+            if apk list -I 2>/dev/null | grep -q "^${_pkg}-"; then
+                return 0
+            fi
+            if apk list --installed 2>/dev/null | grep -q "^${_pkg}-"; then
+                return 0
+            fi
+            return 1
+            ;;
+        opkg)
+            opkg status "$_pkg" 2>/dev/null | grep -q '^Status: install'
+            ;;
+        *)
+            return 1
+            ;;
     esac
+}
+
+packages_missing_from_list() {
+    _list="$1"
+    for _pkg in $_list; do
+        if ! pm_is_installed "$_pkg"; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 pm_install() {
@@ -304,8 +332,14 @@ pm_reinstall() {
 }
 
 install_dependencies() {
-    log_step "Установка зависимостей"
-    pm_update_indexes || die "Не удалось обновить списки пакетов."
+    log_step "Проверка зависимостей"
+
+    if packages_missing_from_list "$DEP_PACKAGES"; then
+        pm_update_indexes || die "Не удалось обновить списки пакетов."
+    else
+        log_info "Все зависимости уже установлены — пропуск обновления индексов."
+    fi
+
     for _pkg in $DEP_PACKAGES; do
         if pm_is_installed "$_pkg"; then
             log_info "Пакет уже установлен: $_pkg"
@@ -491,7 +525,14 @@ verify_tailscale_binaries() {
 }
 
 install_tailscale() {
-    log_step "Установка Tailscale"
+    log_step "Проверка пакета Tailscale"
+
+    if is_tailscale_package_installed; then
+        verify_tailscale_binaries || die "Пакет установлен, но бинарники недоступны."
+        log_ok "Пакет $TAILSCALE_PKG уже установлен — переустановка не требуется."
+        return 0
+    fi
+
     pm_update_indexes || die "Не удалось обновить списки перед установкой."
     log_info "Установка пакета $TAILSCALE_PKG..."
     pm_install "$TAILSCALE_PKG" || die "Не удалось установить пакет."
@@ -501,21 +542,19 @@ install_tailscale() {
 
 ensure_tailscale_installed() {
     if is_tailscale_package_installed; then
-        if is_init_script_executable "$TAILSCALE_INIT_DEFAULT" || \
-           is_init_script_executable "$(init_script_from_package_list)"; then
-            log_ok "Пакет уже установлен."
-            verify_tailscale_binaries || die "Бинарники не найдены."
-            return 0
+        if ! is_init_script_executable "$TAILSCALE_INIT_DEFAULT" \
+            && ! is_init_script_executable "$(init_script_from_package_list)"; then
+            log_warn "Пакет установлен, но init-скрипт отсутствует — переустановка."
+            reinstall_tailscale_package || die "Ошибка переустановки."
         fi
-        log_warn "Пакет установлен, но init-скрипт отсутствует – переустановка."
-        reinstall_tailscale_package || die "Ошибка переустановки."
-        verify_tailscale_binaries || die "Бинарники не найдены после переустановки."
+        verify_tailscale_binaries || die "Бинарники не найдены."
+        log_ok "Пакет $TAILSCALE_PKG уже установлен."
         return 0
     fi
 
-    if binary_in_path tailscale && binary_in_path tailscaled && \
-       is_init_script_executable "$TAILSCALE_INIT_DEFAULT"; then
-        log_ok "Бинарники уже доступны."
+    if binary_in_path tailscale && binary_in_path tailscaled \
+        && is_init_script_executable "$TAILSCALE_INIT_DEFAULT"; then
+        log_ok "Бинарники Tailscale уже доступны."
         return 0
     fi
 
@@ -614,7 +653,7 @@ check_daemon_status() {
 }
 
 manage_service() {
-    log_step "Управление сервисом Tailscale"
+    log_step "Настройка сервиса Tailscale (всегда при повторном запуске)"
     ensure_init_script_exists
     enable_service
 
@@ -699,6 +738,62 @@ ensure_tailscale_interface() {
 }
 
 # =============================================================================
+# UCI network — отображение в LuCI
+# =============================================================================
+
+uci_network_section_exists() {
+    uci -q get "network.${NET_INTERFACE}" >/dev/null 2>&1
+}
+
+configure_network_uci() {
+    log_step "Настройка интерфейса в LuCI (UCI network)"
+
+    if ! uci_network_section_exists; then
+        log_info "Создание network.${NET_INTERFACE}..."
+        uci set "network.${NET_INTERFACE}=interface"
+        uci set "network.${NET_INTERFACE}.proto=${NET_PROTO}"
+        uci set "network.${NET_INTERFACE}.device=${TAILSCALE_IFACE}"
+        uci set "network.${NET_INTERFACE}.auto=1"
+    else
+        log_info "Секция network.${NET_INTERFACE} уже существует."
+        _dev="$(uci -q get "network.${NET_INTERFACE}.device" 2>/dev/null || true)"
+        if [ "$_dev" != "$TAILSCALE_IFACE" ]; then
+            log_info "Обновление device: ${_dev:-?} -> ${TAILSCALE_IFACE}"
+            uci set "network.${NET_INTERFACE}.device=${TAILSCALE_IFACE}"
+        fi
+        _proto="$(uci -q get "network.${NET_INTERFACE}.proto" 2>/dev/null || true)"
+        if [ -z "$_proto" ]; then
+            uci set "network.${NET_INTERFACE}.proto=${NET_PROTO}"
+        fi
+    fi
+
+    uci commit network || die "Не удалось сохранить network.${NET_INTERFACE}."
+    /etc/init.d/network reload 2>/dev/null || log_warn "Перезагрузка network завершилась с предупреждением."
+    log_ok "Интерфейс ${NET_INTERFACE} (${TAILSCALE_IFACE}) доступен в LuCI."
+}
+
+sync_tailscale_ip_to_uci() {
+    _ip=""
+
+    _ip="$(tailscale ip -4 2>/dev/null || true)"
+    if [ -z "$_ip" ]; then
+        return 0
+    fi
+
+    if ! uci_network_section_exists; then
+        configure_network_uci
+    fi
+
+    log_info "Обновление IP в UCI: ${_ip}"
+    uci set "network.${NET_INTERFACE}.proto=static"
+    uci set "network.${NET_INTERFACE}.ipaddr=${_ip}"
+    uci set "network.${NET_INTERFACE}.netmask=255.255.255.255"
+    uci commit network || return 1
+    /etc/init.d/network reload 2>/dev/null || true
+    log_ok "Tailscale IP отображается в LuCI: ${_ip}"
+}
+
+# =============================================================================
 # Tailscale — Exit Node и авторизация
 # =============================================================================
 
@@ -723,15 +818,12 @@ is_tailscale_authenticated() {
 }
 
 build_tailscale_up_command() {
-    _timeout_flag="$TAILSCALE_UP_TIMEOUT"
-    if [ -n "$AUTH_KEY" ]; then
-        _timeout_flag="$TAILSCALE_UP_AUTH_TIMEOUT"
-    fi
-
-    _cmd="tailscale up --reset --timeout=${_timeout_flag}s"
+    _cmd="tailscale up --reset"
 
     if [ -n "$AUTH_KEY" ]; then
         _cmd="$_cmd --auth-key=$AUTH_KEY"
+    else
+        _cmd="$_cmd --timeout=30s"
     fi
 
     # shellcheck disable=SC2086
@@ -743,25 +835,54 @@ run_tailscale_up() {
     _attempt_no="$1"
     _cmd="$(build_tailscale_up_command)"
     _ret=0
-    _timeout="$TAILSCALE_UP_TIMEOUT"
-
-    if [ -n "$AUTH_KEY" ]; then
-        _timeout="$TAILSCALE_UP_AUTH_TIMEOUT"
-    fi
+    _elapsed=0
 
     : > "$TAILSCALE_UP_LOG"
-    log_info "Выполнение (таймаут ${_timeout} с): $_cmd"
 
-    run_with_timeout "$_timeout" sh -c "$_cmd" >> "$TAILSCALE_UP_LOG" 2>&1
-    _ret=$?
+    if [ -n "$AUTH_KEY" ]; then
+        log_info "Регистрация по ключу (ожидание до ${TAILSCALE_UP_AUTH_WAIT_SECS} с): $_cmd"
+        sh -c "$_cmd" >> "$TAILSCALE_UP_LOG" 2>&1 &
+        _pid=$!
 
-    if [ "$_ret" -eq 124 ]; then
-        log_warn "tailscale up #${_attempt_no} не завершился за ${_timeout} с."
-        if have_cmd logread; then
-            log_info "Последние записи tailscaled:"
-            logread 2>/dev/null | grep -i tailscale | tail -n 5 >&2 || true
+        while [ "$_elapsed" -lt "$TAILSCALE_UP_AUTH_WAIT_SECS" ]; do
+            if is_tailscale_authenticated; then
+                log_ok "Авторизация завершена за ${_elapsed} с."
+                kill "$_pid" 2>/dev/null || true
+                wait "$_pid" 2>/dev/null || true
+                _ret=0
+                break
+            fi
+
+            if ! kill -0 "$_pid" 2>/dev/null; then
+                wait "$_pid"
+                _ret=$?
+                break
+            fi
+
+            sleep 2
+            _elapsed=$((_elapsed + 2))
+        done
+
+        if kill -0 "$_pid" 2>/dev/null; then
+            kill "$_pid" 2>/dev/null || true
+            wait "$_pid" 2>/dev/null || true
+            if is_tailscale_authenticated; then
+                _ret=0
+            else
+                _ret=124
+                log_warn "Регистрация не завершилась за ${TAILSCALE_UP_AUTH_WAIT_SECS} с."
+            fi
         fi
-    elif [ "$_ret" -ne 0 ]; then
+    else
+        log_info "Выполнение (таймаут ${TAILSCALE_UP_TIMEOUT} с): $_cmd"
+        run_with_timeout "$TAILSCALE_UP_TIMEOUT" sh -c "$_cmd" >> "$TAILSCALE_UP_LOG" 2>&1
+        _ret=$?
+        if [ "$_ret" -eq 124 ]; then
+            log_warn "tailscale up #${_attempt_no} не завершился за ${TAILSCALE_UP_TIMEOUT} с."
+        fi
+    fi
+
+    if [ "$_ret" -ne 0 ] && [ "$_ret" -ne 124 ]; then
         log_warn "tailscale up #${_attempt_no} завершился с кодом $_ret."
         if grep -q 'flag provided but not defined' "$TAILSCALE_UP_LOG" 2>/dev/null; then
             log_error "Неверный аргумент tailscale up. Проверьте команду в логе выше."
@@ -769,10 +890,18 @@ run_tailscale_up() {
         if grep -qi 'invalid auth key\|auth key expired\|unable to authenticate' "$TAILSCALE_UP_LOG" 2>/dev/null; then
             log_error "Проблема с ключом авторизации. Создайте новый ключ в админке Tailscale."
         fi
+        if grep -qi 'timeout waiting for Tailscale service' "$TAILSCALE_UP_LOG" 2>/dev/null; then
+            log_warn "Демон ещё прогревается — проверьте: tailscale status"
+        fi
     fi
 
     if [ -s "$TAILSCALE_UP_LOG" ]; then
         cat "$TAILSCALE_UP_LOG"
+    fi
+
+    if have_cmd logread && [ "$_ret" -ne 0 ]; then
+        log_info "Последние записи tailscaled:"
+        logread 2>/dev/null | grep -i tailscale | tail -n 5 >&2 || true
     fi
 
     log_interface_state
@@ -834,6 +963,7 @@ configure_exit_node() {
 
     if is_tailscale_authenticated; then
         log_ok "Tailscale уже авторизован (IPv4: $(tailscale ip -4 2>/dev/null)). Пропускаем 'tailscale up'."
+        sync_tailscale_ip_to_uci
         return 0
     fi
 
@@ -856,6 +986,7 @@ configure_exit_node() {
 
         if is_tailscale_authenticated; then
             log_ok "Tailscale успешно авторизован (IPv4: $(tailscale ip -4 2>/dev/null))."
+            sync_tailscale_ip_to_uci
             return 0
         fi
 
@@ -924,7 +1055,11 @@ print_final_report() {
     _state="остановлен"
     is_process_running tailscaled && _state="работает"
     _iface="отсутствует"
-    interface_exists && _iface="создан"
+    if uci_network_section_exists; then
+        interface_exists && _iface="настроен в UCI"
+    elif interface_exists; then
+        _iface="есть в ядре, нет в UCI"
+    fi
     _ts_ip="$(tailscale ip -4 2>/dev/null || true)"
 
     printf '\n=========================================\n Установка Tailscale завершена\n=========================================\n\n'
@@ -983,6 +1118,7 @@ main() {
     ensure_tailscale_installed
     configure_tailscale_daemon
     manage_service
+    configure_network_uci
     configure_exit_node
 
     # Установка считается успешной при работающем демоне, даже без авторизации
