@@ -449,26 +449,29 @@ start_service() {
     "$TAILSCALE_INIT_PATH" start || die "Не удалось запустить сервис."
 }
 
-# Проверка готовности демона через tailscale status
+# Проверка готовности демона по наличию сокета
 wait_for_daemon_ready() {
     _elapsed=0
-    log_info "Ожидание готовности tailscaled (до ${DAEMON_WAIT_SECS} с)..."
+    _sock="/var/run/tailscale/tailscaled.sock"
+    log_info "Ожидание появления сокета tailscaled (до ${DAEMON_WAIT_SECS} с)..."
     while [ "$_elapsed" -lt "$DAEMON_WAIT_SECS" ]; do
-        if is_process_running tailscaled && tailscale status >/dev/null 2>&1; then
-            log_ok "Демон готов."
+        if [ -S "$_sock" ]; then
+            log_ok "Демон готов (сокет $_sock)."
             return 0
         fi
         sleep "$DAEMON_POLL_SECS"
         _elapsed=$((_elapsed + DAEMON_POLL_SECS))
     done
-    log_error "Демон не готов за ${DAEMON_WAIT_SECS} с."
-    # Диагностика
+    log_warn "Сокет $_sock не появился за ${DAEMON_WAIT_SECS} с."
+    # Проверяем, жив ли процесс
     if is_process_running tailscaled; then
-        log_error "Процесс tailscaled запущен, но не отвечает. Проверьте логи: logread | grep tailscale"
+        log_warn "Процесс tailscaled запущен, но сокет недоступен. Проверьте логи: logread | grep tailscale"
+        log_warn "Продолжаем выполнение, возможно, сокет появится позже."
+        return 0
     else
         log_error "Процесс tailscaled не найден. Проверьте логи: logread | grep tailscale"
+        return 1
     fi
-    return 1
 }
 
 check_daemon_status() {
@@ -485,7 +488,8 @@ manage_service() {
     ensure_init_script_exists
     enable_service
     start_service
-    wait_for_daemon_ready || die "Tailscaled не готов."
+    wait_for_daemon_ready || die "Tailscaled не запущен."
+    # Если сокет не появился, но процесс жив, продолжаем – configure_exit_node попытается выполнить tailscale up
 }
 
 # =============================================================================
