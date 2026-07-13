@@ -21,15 +21,20 @@ readonly TAILSCALE_INIT_DEFAULT="/etc/init.d/tailscale"
 readonly TAILSCALE_UP_ARGS="--advertise-exit-node --accept-dns=false --netfilter-mode=off --ssh"
 
 readonly DEP_PACKAGES="kmod-tun ca-bundle"
+readonly OPTIONAL_PACKAGES="iptables-nft"
 readonly MIN_FREE_KIB=10240
 readonly DAEMON_WAIT_SECS=30
 readonly DAEMON_POLL_SECS=2
-readonly TAILSCALE_UP_TIMEOUT=15   # секунд ожидания при отсутствии ключа
+readonly TAILSCALE_UP_TIMEOUT=15
+readonly TAILSCALE_UP_AUTH_TIMEOUT=120
 
 readonly TAILSCALE_IFACE="tailscale0"
+readonly TAILSCALE_UCI_CONFIG="/etc/config/tailscale"
+readonly TAILSCALE_FW_MODE="off"
+readonly SYS_NET_PATH="/sys/class/net"
 readonly IFACE_WAIT_SECS=10
-readonly IFACE_BIND_WAIT_SECS=2
-readonly IFACE_RETRY_WAIT_SECS=3
+readonly IFACE_BIND_WAIT_SECS=3
+readonly IFACE_RETRY_WAIT_SECS=5
 readonly TAILSCALE_UP_LOG="/tmp/tailscale_up.log"
 readonly TAILSCALE_UP_MAX_ATTEMPTS=2
 
@@ -136,11 +141,31 @@ is_process_running() {
 }
 
 interface_exists() {
-    ip link show "$TAILSCALE_IFACE" >/dev/null 2>&1
+    [ -d "${SYS_NET_PATH}/${TAILSCALE_IFACE}" ] \
+        && ip link show dev "$TAILSCALE_IFACE" >/dev/null 2>&1
 }
 
-interface_is_up() {
-    interface_exists && ip link show "$TAILSCALE_IFACE" 2>/dev/null | grep -q 'state UP\|state UNKNOWN'
+interface_link_is_up() {
+    interface_exists || return 1
+    ip -o link show dev "$TAILSCALE_IFACE" 2>/dev/null | grep -q '<.*UP.*>'
+}
+
+interface_is_operational() {
+    interface_link_is_up
+}
+
+log_interface_state() {
+    _state="$(ip -o link show dev "$TAILSCALE_IFACE" 2>/dev/null || echo 'отсутствует')"
+    log_info "Состояние ${TAILSCALE_IFACE}: ${_state}"
+}
+
+is_mips_platform() {
+    case "$SYS_ARCH" in
+        mips*|*mips*|ramips*)
+            return 0
+            ;;
+    esac
+    return 1
 }
 
 read_openwrt_var() {
@@ -292,6 +317,17 @@ install_dependencies() {
     log_ok "Зависимости готовы."
 }
 
+install_optional_packages() {
+    for _pkg in $OPTIONAL_PACKAGES; do
+        if pm_is_installed "$_pkg"; then
+            log_info "Опциональный пакет уже установлен: $_pkg"
+            continue
+        fi
+        log_info "Пробуем установить опциональный пакет: $_pkg"
+        pm_install "$_pkg" 2>/dev/null || log_warn "Пакет $_pkg недоступен (не критично при fw_mode=off)."
+    done
+}
+
 # =============================================================================
 # Настройка времени (опционально)
 # =============================================================================
@@ -357,35 +393,47 @@ ensure_tun() {
 }
 
 # =============================================================================
-# Создание фиктивных iptables (для обхода проверок демона)
+# Netfilter и конфигурация демона
 # =============================================================================
 
-ensure_fake_iptables() {
-    log_step "Проверка iptables/ip6tables"
+ensure_netfilter_tools() {
+    log_step "Проверка netfilter"
 
-    _create_fake() {
-        _bin="$1"
-        if ! have_cmd "$_bin"; then
-            log_info "Создание фиктивного $_bin..."
-            cat > "/usr/bin/$_bin" << EOF
-#!/bin/sh
-# Фиктивный $_bin для Tailscale
-if [ "\$1" = "--version" ]; then
-    echo "$_bin v1.8.7 (legacy)"
-    exit 0
-else
-    exit 0
-fi
-EOF
-            chmod +x "/usr/bin/$_bin"
-            log_ok "Фиктивный $_bin создан."
+    if have_cmd iptables && have_cmd ip6tables; then
+        log_ok "iptables/ip6tables доступны."
+        return 0
+    fi
+
+    log_warn "iptables/ip6tables не найдены — пробуем установить iptables-nft..."
+    install_optional_packages
+}
+
+configure_tailscale_daemon() {
+    log_step "Настройка демона Tailscale (UCI)"
+
+    if ! uci -q get tailscale.settings >/dev/null 2>&1; then
+        if [ -f "$TAILSCALE_UCI_CONFIG" ]; then
+            log_info "Загрузка существующего $TAILSCALE_UCI_CONFIG"
         else
-            log_ok "$_bin уже существует."
+            log_info "Создание минимальной конфигурации tailscale..."
+            uci set tailscale.settings=settings
+            uci set tailscale.settings.log_stderr='1'
+            uci set tailscale.settings.log_stdout='1'
+            uci set tailscale.settings.port='41641'
+            uci set tailscale.settings.state_file='/var/lib/tailscale/tailscaled.state'
         fi
-    }
+    fi
 
-    _create_fake iptables
-    _create_fake ip6tables
+    _current_fw="$(uci -q get tailscale.settings.fw_mode 2>/dev/null || true)"
+    if [ "$_current_fw" != "$TAILSCALE_FW_MODE" ]; then
+        log_info "Установка tailscale.settings.fw_mode=${TAILSCALE_FW_MODE}"
+        uci set "tailscale.settings.fw_mode=${TAILSCALE_FW_MODE}"
+    else
+        log_info "tailscale.settings.fw_mode уже ${TAILSCALE_FW_MODE}"
+    fi
+
+    uci commit tailscale || die "Не удалось сохранить /etc/config/tailscale"
+    log_ok "Демон настроен: netfilter отключён на уровне tailscaled."
 }
 
 # =============================================================================
@@ -547,9 +595,16 @@ manage_service() {
     log_step "Управление сервисом Tailscale"
     ensure_init_script_exists
     enable_service
-    start_service
-    wait_for_daemon_ready || die "Tailscaled не запущен."
-    ensure_tailscale_interface || log_warn "Не удалось создать интерфейс ${TAILSCALE_IFACE}, возможны проблемы с авторизацией."
+
+    if is_process_running tailscaled; then
+        log_info "Демон уже запущен — перезапуск с актуальной конфигурацией..."
+        restart_tailscale_service || die "Не удалось перезапустить Tailscale."
+    else
+        start_service
+        wait_for_daemon_ready || die "Tailscaled не запущен."
+    fi
+
+    ensure_tailscale_interface || log_warn "Не удалось подготовить ${TAILSCALE_IFACE}."
     check_daemon_status || die "Проверка статуса tailscaled не пройдена."
 }
 
@@ -557,50 +612,68 @@ manage_service() {
 # Интерфейс tailscale0
 # =============================================================================
 
+restart_tailscale_service() {
+    if [ -z "$TAILSCALE_INIT_PATH" ] || [ ! -x "$TAILSCALE_INIT_PATH" ]; then
+        resolve_tailscale_init_path || return 1
+    fi
+
+    log_info "Перезапуск сервиса Tailscale..."
+    "$TAILSCALE_INIT_PATH" restart || return 1
+    wait_for_daemon_ready || return 1
+    return 0
+}
+
+create_tailscale_tun_interface() {
+    if interface_exists; then
+        log_info "Интерфейс ${TAILSCALE_IFACE} уже есть в sysfs — поднимаем link..."
+        ip link set dev "$TAILSCALE_IFACE" up 2>/dev/null || return 1
+        return 0
+    fi
+
+    log_info "Создание TUN-интерфейса ${TAILSCALE_IFACE} через ip tuntap..."
+    ip tuntap add mode tun dev "$TAILSCALE_IFACE" 2>/dev/null || return 1
+    ip link set dev "$TAILSCALE_IFACE" up 2>/dev/null || return 1
+    return 0
+}
+
 ensure_tailscale_interface() {
     _elapsed=0
 
-    log_info "Проверка наличия интерфейса ${TAILSCALE_IFACE}..."
+    log_info "Проверка интерфейса ${TAILSCALE_IFACE}..."
+    log_interface_state
 
     while [ "$_elapsed" -lt "$IFACE_WAIT_SECS" ]; do
-        if interface_is_up; then
-            log_ok "Интерфейс ${TAILSCALE_IFACE} уже существует."
+        if interface_is_operational; then
+            log_ok "Интерфейс ${TAILSCALE_IFACE} готов."
             return 0
-        fi
-        if interface_exists; then
-            log_info "Интерфейс ${TAILSCALE_IFACE} найден, но не поднят — поднимаем..."
-            ip link set "$TAILSCALE_IFACE" up 2>/dev/null && {
-                log_ok "Интерфейс ${TAILSCALE_IFACE} поднят."
-                sleep "$IFACE_BIND_WAIT_SECS"
-                return 0
-            }
         fi
         sleep 1
         _elapsed=$((_elapsed + 1))
     done
 
-    log_warn "Интерфейс ${TAILSCALE_IFACE} не появился за ${IFACE_WAIT_SECS} с. Создаём вручную..."
-
-    if interface_exists; then
-        ip link set "$TAILSCALE_IFACE" up 2>/dev/null || {
-            log_error "Не удалось поднять интерфейс ${TAILSCALE_IFACE}."
-            return 1
-        }
+    if is_mips_platform; then
+        log_warn "Платформа MIPS: tailscaled часто не создаёт ${TAILSCALE_IFACE} самостоятельно."
     else
-        ip tuntap add mode tun dev "$TAILSCALE_IFACE" 2>/dev/null || {
-            log_error "Не удалось создать интерфейс через ip tuntap. Проверьте поддержку TUN."
-            return 1
-        }
-        ip link set "$TAILSCALE_IFACE" up 2>/dev/null || {
-            log_error "Не удалось поднять интерфейс ${TAILSCALE_IFACE}."
-            return 1
-        }
+        log_warn "Интерфейс ${TAILSCALE_IFACE} не появился за ${IFACE_WAIT_SECS} с."
     fi
 
-    log_ok "Интерфейс ${TAILSCALE_IFACE} создан и поднят."
-    log_info "Ожидание привязки демона к интерфейсу (${IFACE_BIND_WAIT_SECS} с)..."
+    if ! create_tailscale_tun_interface; then
+        log_error "Не удалось создать ${TAILSCALE_IFACE}. Проверьте kmod-tun и /dev/net/tun."
+        return 1
+    fi
+
+    log_ok "Интерфейс ${TAILSCALE_IFACE} создан вручную."
+    log_info "Ожидание привязки к работающему tailscaled (${IFACE_BIND_WAIT_SECS} с)..."
+    log_info "Перезапуск не выполняется: tailscaled --cleanup удалил бы интерфейс."
     sleep "$IFACE_BIND_WAIT_SECS"
-    return 0
+    log_interface_state
+
+    if interface_exists; then
+        return 0
+    fi
+
+    log_error "Интерфейс ${TAILSCALE_IFACE} по-прежнему отсутствует."
+    return 1
 }
 
 # =============================================================================
@@ -634,39 +707,46 @@ build_tailscale_up_command() {
         _cmd="$_cmd --auth-key=$AUTH_KEY"
     fi
 
+    if is_mips_platform; then
+        _cmd="$_cmd --tun=$TAILSCALE_IFACE"
+    fi
+
     # shellcheck disable=SC2086
     _cmd="$_cmd $TAILSCALE_UP_ARGS"
     printf '%s' "$_cmd"
 }
 
 run_tailscale_up() {
-    _use_timeout="$1"
+    _attempt_no="$1"
     _cmd="$(build_tailscale_up_command)"
     _ret=0
+    _timeout="$TAILSCALE_UP_TIMEOUT"
+
+    if [ -n "$AUTH_KEY" ]; then
+        _timeout="$TAILSCALE_UP_AUTH_TIMEOUT"
+    fi
 
     : > "$TAILSCALE_UP_LOG"
-    log_info "Выполнение: $_cmd"
+    log_info "Выполнение (таймаут ${_timeout} с): $_cmd"
 
-    if [ "$_use_timeout" -eq 1 ] && [ -z "$AUTH_KEY" ]; then
-        run_with_timeout "$TAILSCALE_UP_TIMEOUT" sh -c "$_cmd" >> "$TAILSCALE_UP_LOG" 2>&1
-        _ret=$?
-        if [ "$_ret" -eq 124 ]; then
-            log_warn "tailscale up не завершился за ${TAILSCALE_UP_TIMEOUT} с (таймаут)."
-        elif [ "$_ret" -ne 0 ]; then
-            log_warn "tailscale up завершился с кодом $_ret."
+    run_with_timeout "$_timeout" sh -c "$_cmd" >> "$TAILSCALE_UP_LOG" 2>&1
+    _ret=$?
+
+    if [ "$_ret" -eq 124 ]; then
+        log_warn "tailscale up #${_attempt_no} не завершился за ${_timeout} с."
+        if have_cmd logread; then
+            log_info "Последние записи tailscaled:"
+            logread 2>/dev/null | grep -i tailscale | tail -n 5 >&2 || true
         fi
-    else
-        sh -c "$_cmd" >> "$TAILSCALE_UP_LOG" 2>&1
-        _ret=$?
-        if [ "$_ret" -ne 0 ]; then
-            log_warn "tailscale up завершился с кодом $_ret."
-        fi
+    elif [ "$_ret" -ne 0 ]; then
+        log_warn "tailscale up #${_attempt_no} завершился с кодом $_ret."
     fi
 
     if [ -s "$TAILSCALE_UP_LOG" ]; then
         cat "$TAILSCALE_UP_LOG"
     fi
 
+    log_interface_state
     return "$_ret"
 }
 
@@ -737,24 +817,23 @@ configure_exit_node() {
         _attempt=$((_attempt + 1))
         log_info "Попытка авторизации #${_attempt} из ${TAILSCALE_UP_MAX_ATTEMPTS}..."
 
-        if [ "$_attempt" -eq 1 ] && [ -z "$AUTH_KEY" ]; then
-            run_tailscale_up 1
-        else
-            run_tailscale_up 0
+        if ! interface_is_operational; then
+            log_warn "Интерфейс ${TAILSCALE_IFACE} не готов — восстанавливаем..."
+            ensure_tailscale_interface || log_warn "Не удалось подготовить ${TAILSCALE_IFACE}."
+            sleep "$IFACE_RETRY_WAIT_SECS"
         fi
+
+        run_tailscale_up "$_attempt"
 
         if is_tailscale_authenticated; then
             log_ok "Tailscale успешно авторизован."
             return 0
         fi
 
-        if ! interface_exists; then
-            log_warn "Интерфейс ${TAILSCALE_IFACE} отсутствует — создаём..."
-            ensure_tailscale_interface || log_warn "Не удалось создать интерфейс ${TAILSCALE_IFACE}."
-            log_info "Ожидание перед повторной попыткой (${IFACE_RETRY_WAIT_SECS} с)..."
+        if [ "$_attempt" -lt "$TAILSCALE_UP_MAX_ATTEMPTS" ]; then
+            log_info "Повторная подготовка интерфейса перед следующей попыткой..."
+            ensure_tailscale_interface || true
             sleep "$IFACE_RETRY_WAIT_SECS"
-        elif [ "$_attempt" -lt "$TAILSCALE_UP_MAX_ATTEMPTS" ]; then
-            log_info "Интерфейс ${TAILSCALE_IFACE} присутствует — повторяем tailscale up без таймаута..."
         fi
 
         if [ "$_attempt" -eq "$TAILSCALE_UP_MAX_ATTEMPTS" ]; then
@@ -861,10 +940,11 @@ main() {
     install_dependencies
     configure_timezone          # опционально, не влияет на сеть
 
-    ensure_tun                  # загружаем модуль tun, создаём /dev/net/tun
-    ensure_fake_iptables        # создаём фиктивные iptables/ip6tables
+    ensure_tun
+    ensure_netfilter_tools
 
     ensure_tailscale_installed
+    configure_tailscale_daemon
     manage_service
     configure_exit_node
 
