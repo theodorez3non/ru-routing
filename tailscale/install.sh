@@ -1,11 +1,10 @@
 #!/bin/sh
 #
 # Tailscale Exit Node — production installer for OpenWrt 24.x / 25.x
+# С поддержкой зеркал репозиториев, неинтерактивной авторизации и настройкой времени.
 #
-# Устанавливает официальный пакет Tailscale, настраивает сеть, firewall
-# и поднимает туннель в режиме Exit Node. Идемпотентен при повторном запуске.
-#
-# Совместимость: BusyBox ash (/bin/sh), opkg (24.x), apk (25.x)
+# Использование:
+#   sh install.sh --mirror <URL> [--auth-key <ключ>]
 #
 
 set -u
@@ -39,11 +38,19 @@ readonly DEP_PACKAGES="kmod-tun ca-bundle"
 readonly MIN_FREE_KIB=10240
 readonly DAEMON_WAIT_SECS=30
 readonly DAEMON_POLL_SECS=2
+readonly TAILSCALE_UP_TIMEOUT=15   # секунд ожидания авторизации
 
 readonly OPENWRT_RELEASE_FILE="/etc/openwrt_release"
 
+# Настройки времени
+readonly TIMEZONE_NAME="Europe/Moscow"
+readonly TIMEZONE_STRING="MSK-3"
+
+# Служебные файлы
+readonly FORWARDING_BACKUP="/etc/tailscale/.forwarding_orig"
+
 # =============================================================================
-# Состояние (заполняется при обнаружении системы)
+# Состояние
 # =============================================================================
 
 SYS_ARCH=""
@@ -51,9 +58,13 @@ SYS_VERSION=""
 SYS_PM=""
 SYS_FREE_KIB=""
 TAILSCALE_INIT_PATH=""
+REPO_FILE=""
+
+MIRROR_URL=""
+AUTH_KEY=""
 
 # =============================================================================
-# Цвета терминала
+# Цвета
 # =============================================================================
 
 if [ -t 1 ]; then
@@ -76,56 +87,67 @@ fi
 # Логирование
 # =============================================================================
 
-log_info() {
-    printf '%b[INFO]%b %s\n' "$C_INFO" "$C_RST" "$1"
-}
-
-log_ok() {
-    printf '%b[OK]%b %s\n' "$C_OK" "$C_RST" "$1"
-}
-
-log_warn() {
-    printf '%b[WARN]%b %s\n' "$C_WARN" "$C_RST" "$1"
-}
-
-log_error() {
-    printf '%b[ERROR]%b %s\n' "$C_ERR" "$C_RST" "$1" >&2
-}
-
-log_step() {
-    printf '%b==>%b %s\n' "$C_HDR" "$C_RST" "$1"
-}
-
-die() {
-    log_error "$1"
-    exit 1
-}
+log_info() { printf '%b[INFO]%b %s\n' "$C_INFO" "$C_RST" "$1"; }
+log_ok()   { printf '%b[OK]%b %s\n'   "$C_OK"   "$C_RST" "$1"; }
+log_warn() { printf '%b[WARN]%b %s\n' "$C_WARN" "$C_RST" "$1"; }
+log_error(){ printf '%b[ERROR]%b %s\n' "$C_ERR"  "$C_RST" "$1" >&2; }
+log_step() { printf '%b==>%b %s\n' "$C_HDR" "$C_RST" "$1"; }
+die()      { log_error "$1"; exit 1; }
 
 # =============================================================================
 # Утилиты
 # =============================================================================
 
 require_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        die "Скрипт необходимо запускать от root."
+    [ "$(id -u)" -eq 0 ] || die "Скрипт необходимо запускать от root."
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Проверка и запуск команды с таймаутом (собственная реализация)
+run_with_timeout() {
+    _timeout="$1"
+    shift
+    if have_cmd timeout; then
+        timeout "$_timeout" "$@"
+        return $?
+    fi
+    # Fallback: запустить в фоне, убить через timeout
+    "$@" &
+    _pid=$!
+    _elapsed=0
+    while [ "$_elapsed" -lt "$_timeout" ]; do
+        sleep 1
+        _elapsed=$((_elapsed + 1))
+        # Проверим, жив ли процесс
+        kill -0 "$_pid" 2>/dev/null || break
+    done
+    if kill -0 "$_pid" 2>/dev/null; then
+        kill "$_pid" 2>/dev/null
+        wait "$_pid" 2>/dev/null
+        return 124 # таймаут
+    else
+        wait "$_pid" 2>/dev/null
+        return $?
     fi
 }
 
-have_cmd() {
-    command -v "$1" >/dev/null 2>&1
+# Проверка наличия процесса по имени
+is_process_running() {
+    _name="$1"
+    if have_cmd pidof; then
+        pidof "$_name" >/dev/null 2>&1 && return 0
+    else
+        # fallback через ps
+        ps -w | grep -v grep | grep -q "[${_name%?}]${_name#?}" && return 0
+    fi
+    return 1
 }
 
 read_openwrt_var() {
-    _var_name="$1"
-
-    if [ ! -f "$OPENWRT_RELEASE_FILE" ]; then
-        return 0
-    fi
-
-    grep "^${_var_name}=" "$OPENWRT_RELEASE_FILE" 2>/dev/null \
-        | head -n 1 \
-        | cut -d= -f2- \
-        | tr -d "'\""
+    _var="$1"
+    [ -f "$OPENWRT_RELEASE_FILE" ] || return 0
+    grep "^${_var}=" "$OPENWRT_RELEASE_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d "'\""
 }
 
 # =============================================================================
@@ -133,19 +155,13 @@ read_openwrt_var() {
 # =============================================================================
 
 detect_architecture() {
-    _arch="$(read_openwrt_var DISTRIB_ARCH)"
-    if [ -z "$_arch" ]; then
-        _arch="$(uname -m 2>/dev/null || echo unknown)"
-    fi
-    SYS_ARCH="$_arch"
+    SYS_ARCH="$(read_openwrt_var DISTRIB_ARCH)"
+    [ -z "$SYS_ARCH" ] && SYS_ARCH="$(uname -m 2>/dev/null || echo unknown)"
 }
 
 detect_openwrt_version() {
-    _ver="$(read_openwrt_var DISTRIB_RELEASE)"
-    if [ -z "$_ver" ]; then
-        _ver="unknown"
-    fi
-    SYS_VERSION="$_ver"
+    SYS_VERSION="$(read_openwrt_var DISTRIB_RELEASE)"
+    [ -z "$SYS_VERSION" ] && SYS_VERSION="unknown"
 }
 
 detect_package_manager() {
@@ -160,13 +176,9 @@ detect_package_manager() {
 
 detect_free_space() {
     _target="/overlay"
-    if ! df -k "$_target" >/dev/null 2>&1; then
-        _target="/"
-    fi
+    df -k "$_target" >/dev/null 2>&1 || _target="/"
     SYS_FREE_KIB="$(df -k "$_target" 2>/dev/null | awk 'NR==2 {print $4}')"
-    if [ -z "$SYS_FREE_KIB" ]; then
-        SYS_FREE_KIB="0"
-    fi
+    [ -z "$SYS_FREE_KIB" ] && SYS_FREE_KIB=0
 }
 
 detect_system() {
@@ -177,37 +189,53 @@ detect_system() {
 }
 
 validate_environment() {
-    if [ "$SYS_PM" = "unknown" ]; then
-        die "Не найден поддерживаемый пакетный менеджер (opkg или apk)."
-    fi
-
+    [ "$SYS_PM" = "unknown" ] && die "Не найден пакетный менеджер (opkg/apk)."
     if [ "$SYS_FREE_KIB" -lt "$MIN_FREE_KIB" ] 2>/dev/null; then
         log_warn "Мало свободного места: ${SYS_FREE_KIB} KiB (рекомендуется >= ${MIN_FREE_KIB} KiB)."
     fi
-
-    validate_core_firewall_zones
 }
 
-validate_core_firewall_zones() {
-    _idx=0
-    _have_lan=0
-    _have_wan=0
+# =============================================================================
+# Работа с зеркалом репозиториев
+# =============================================================================
 
-    while uci -q get "firewall.@zone[${_idx}]" >/dev/null 2>&1; do
-        _name="$(uci -q get "firewall.@zone[${_idx}].name" 2>/dev/null || true)"
-        if [ "$_name" = "lan" ]; then
-            _have_lan=1
-        fi
-        if [ "$_name" = "wan" ]; then
-            _have_wan=1
-        fi
-        _idx=$((_idx + 1))
-    done
+setup_mirror() {
+    [ -z "$MIRROR_URL" ] && return 0
 
-    if [ "$_have_lan" -eq 0 ] || [ "$_have_wan" -eq 0 ]; then
-        log_warn "Firewall повреждён: отсутствует зона lan и/или wan."
-        log_warn "Восстановите /etc/config/firewall перед продолжением."
-        log_warn "Пример: cp /etc/config/firewall-opkg /etc/config/firewall (если есть бэкап)."
+    case "$SYS_PM" in
+        apk)
+            if [ -f "/etc/apk/repositories.d/distfeeds.list" ]; then
+                REPO_FILE="/etc/apk/repositories.d/distfeeds.list"
+            elif [ -f "/etc/apk/repositories" ]; then
+                REPO_FILE="/etc/apk/repositories"
+            else
+                log_warn "Файл репозиториев apk не найден, пропускаем замену."
+                return 0
+            fi
+            ;;
+        opkg)
+            if [ -f "/etc/opkg/distfeeds.conf" ]; then
+                REPO_FILE="/etc/opkg/distfeeds.conf"
+            else
+                log_warn "Файл репозиториев opkg не найден, пропускаем замену."
+                return 0
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+
+    [ ! -f "$REPO_FILE" ] && { log_warn "Файл $REPO_FILE не найден"; return 0; }
+
+    cp "$REPO_FILE" "${REPO_FILE}.backup" || return 1
+    sed -i "s|https\?://downloads.openwrt.org|$MIRROR_URL|g" "$REPO_FILE" || return 1
+    log_info "Зеркало установлено: $MIRROR_URL"
+    return 0
+}
+
+restore_mirror() {
+    [ -z "$MIRROR_URL" ] || [ -z "$REPO_FILE" ] && return 0
+    if [ -f "${REPO_FILE}.backup" ]; then
+        mv "${REPO_FILE}.backup" "$REPO_FILE" 2>/dev/null && log_info "Репозитории восстановлены."
     fi
 }
 
@@ -217,73 +245,43 @@ validate_core_firewall_zones() {
 
 pm_update_indexes() {
     log_info "Обновление списков пакетов ($SYS_PM)..."
-
     case "$SYS_PM" in
-        apk)
-            apk update || return 1
-            ;;
-        opkg)
-            opkg update || return 1
-            ;;
-        *)
-            return 1
-            ;;
+        apk) apk update || return 1 ;;
+        opkg) opkg update || return 1 ;;
+        *) return 1 ;;
     esac
 }
 
 pm_is_installed() {
     _pkg="$1"
-
     case "$SYS_PM" in
-        apk)
-            apk info -e "$_pkg" >/dev/null 2>&1
-            ;;
-        opkg)
-            opkg status "$_pkg" 2>/dev/null | grep -q '^Status: install'
-            ;;
-        *)
-            return 1
-            ;;
+        apk) apk info -e "$_pkg" >/dev/null 2>&1 ;;
+        opkg) opkg status "$_pkg" 2>/dev/null | grep -q '^Status: install' ;;
+        *) return 1 ;;
     esac
 }
 
 pm_install() {
     _pkg="$1"
-
     case "$SYS_PM" in
-        apk)
-            apk add "$_pkg" || return 1
-            ;;
-        opkg)
-            opkg install "$_pkg" || return 1
-            ;;
-        *)
-            return 1
-            ;;
+        apk) apk add "$_pkg" || return 1 ;;
+        opkg) opkg install "$_pkg" || return 1 ;;
+        *) return 1 ;;
     esac
 }
 
 pm_reinstall() {
     _pkg="$1"
-
     case "$SYS_PM" in
-        apk)
-            apk add --force-overwrite "$_pkg" || return 1
-            ;;
-        opkg)
-            opkg install --force-reinstall "$_pkg" || return 1
-            ;;
-        *)
-            return 1
-            ;;
+        apk) apk add --force-overwrite "$_pkg" || return 1 ;;
+        opkg) opkg install --force-reinstall "$_pkg" || return 1 ;;
+        *) return 1 ;;
     esac
 }
 
 install_dependencies() {
     log_step "Установка зависимостей"
-
     pm_update_indexes || die "Не удалось обновить списки пакетов."
-
     for _pkg in $DEP_PACKAGES; do
         if pm_is_installed "$_pkg"; then
             log_info "Пакет уже установлен: $_pkg"
@@ -292,95 +290,102 @@ install_dependencies() {
             pm_install "$_pkg" || die "Не удалось установить пакет: $_pkg"
         fi
     done
-
     log_ok "Зависимости готовы."
+}
+
+# =============================================================================
+# Настройка времени
+# =============================================================================
+
+configure_timezone() {
+    log_step "Настройка часового пояса"
+
+    if uci -q get system.@system[0] >/dev/null 2>&1; then
+        _idx=0
+    else
+        log_info "Создание секции system..."
+        uci add system system
+        _idx=0
+    fi
+
+    _current_zone="$(uci -q get system.@system[${_idx}].zonename 2>/dev/null || true)"
+    _current_timezone="$(uci -q get system.@system[${_idx}].timezone 2>/dev/null || true)"
+
+    if [ "$_current_zone" = "$TIMEZONE_NAME" ] && [ "$_current_timezone" = "$TIMEZONE_STRING" ]; then
+        log_info "Часовой пояс уже настроен: $TIMEZONE_NAME"
+        return 0
+    fi
+
+    log_info "Установка часового пояса: $TIMEZONE_NAME ($TIMEZONE_STRING)"
+    uci set "system.@system[${_idx}].zonename=$TIMEZONE_NAME"
+    uci set "system.@system[${_idx}].timezone=$TIMEZONE_STRING"
+    uci commit system
+
+    if /etc/init.d/sysntpd status >/dev/null 2>&1; then
+        /etc/init.d/sysntpd restart || log_warn "Не удалось перезапустить sysntpd."
+    fi
+
+    log_ok "Часовой пояс установлен."
 }
 
 # =============================================================================
 # Tailscale — установка и проверка
 # =============================================================================
 
-is_tailscale_package_installed() {
-    pm_is_installed "$TAILSCALE_PKG"
-}
+is_tailscale_package_installed() { pm_is_installed "$TAILSCALE_PKG"; }
 
-binary_in_path() {
-    _name="$1"
-    have_cmd "$_name"
-}
+binary_in_path() { have_cmd "$1"; }
 
 binary_from_package_list() {
-    _name="$1"
-
+    _bin="$1"
     case "$SYS_PM" in
-        opkg)
-            opkg files "$TAILSCALE_PKG" 2>/dev/null | grep -q "/${_name}\$"
-            ;;
-        apk)
-            apk info -L "$TAILSCALE_PKG" 2>/dev/null | grep -q "/${_name}\$"
-            ;;
-        *)
-            return 1
-            ;;
+        opkg) opkg files "$TAILSCALE_PKG" 2>/dev/null | grep -q "/${_bin}\$" ;;
+        apk)  apk info -L "$TAILSCALE_PKG" 2>/dev/null | grep -q "/${_bin}\$" ;;
+        *) return 1 ;;
     esac
 }
 
 verify_tailscale_binaries() {
     _missing=""
-
     for _bin in tailscale tailscaled; do
         if binary_in_path "$_bin"; then
             log_ok "Бинарник найден в PATH: $_bin"
-            continue
-        fi
-
-        if binary_from_package_list "$_bin"; then
+        elif binary_from_package_list "$_bin"; then
             log_ok "Бинарник найден в пакете: $_bin"
-            continue
+        else
+            _missing="${_missing} ${_bin}"
         fi
-
-        _missing="${_missing} ${_bin}"
     done
-
-    if [ -n "$_missing" ]; then
-        log_error "Не найдены бинарники:${_missing}"
-        return 1
-    fi
-
+    [ -n "$_missing" ] && { log_error "Не найдены бинарники:${_missing}"; return 1; }
     return 0
 }
 
 install_tailscale() {
     log_step "Установка Tailscale"
-
-    pm_update_indexes || die "Не удалось обновить списки пакетов перед установкой Tailscale."
-
-    log_info "Установка пакета $TAILSCALE_PKG через $SYS_PM..."
-    pm_install "$TAILSCALE_PKG" || die "Не удалось установить пакет $TAILSCALE_PKG."
-
-    verify_tailscale_binaries || die "Tailscale установлен, но бинарники недоступны."
-
+    pm_update_indexes || die "Не удалось обновить списки перед установкой."
+    log_info "Установка пакета $TAILSCALE_PKG..."
+    pm_install "$TAILSCALE_PKG" || die "Не удалось установить пакет."
+    verify_tailscale_binaries || die "Бинарники недоступны."
     log_ok "Tailscale установлен."
 }
 
 ensure_tailscale_installed() {
     if is_tailscale_package_installed; then
-        if is_init_script_executable "$TAILSCALE_INIT_DEFAULT" \
-            || is_init_script_executable "$(init_script_from_package_list)"; then
-            log_ok "Пакет $TAILSCALE_PKG уже установлен — переустановка не требуется."
-            verify_tailscale_binaries || die "Пакет установлен, но бинарники tailscale/tailscaled недоступны."
+        if is_init_script_executable "$TAILSCALE_INIT_DEFAULT" || \
+           is_init_script_executable "$(init_script_from_package_list)"; then
+            log_ok "Пакет уже установлен."
+            verify_tailscale_binaries || die "Бинарники не найдены."
             return 0
         fi
-
-        log_warn "Пакет $TAILSCALE_PKG установлен, но init-скрипт отсутствует."
-        reinstall_tailscale_package || die "Не удалось восстановить файлы пакета $TAILSCALE_PKG."
-        verify_tailscale_binaries || die "После переустановки бинарники tailscale/tailscaled недоступны."
+        log_warn "Пакет установлен, но init-скрипт отсутствует – переустановка."
+        reinstall_tailscale_package || die "Ошибка переустановки."
+        verify_tailscale_binaries || die "Бинарники не найдены после переустановки."
         return 0
     fi
 
-    if binary_in_path tailscale && binary_in_path tailscaled \
-        && is_init_script_executable "$TAILSCALE_INIT_DEFAULT"; then
-        log_ok "Бинарники Tailscale уже доступны — установка пакета не требуется."
+    if binary_in_path tailscale && binary_in_path tailscaled && \
+       is_init_script_executable "$TAILSCALE_INIT_DEFAULT"; then
+        log_ok "Бинарники уже доступны."
         return 0
     fi
 
@@ -388,134 +393,99 @@ ensure_tailscale_installed() {
 }
 
 # =============================================================================
-# Сервис Tailscale (штатный init.d из пакета)
+# Сервис Tailscale
 # =============================================================================
 
 init_script_from_package_list() {
     case "$SYS_PM" in
-        opkg)
-            opkg files "$TAILSCALE_PKG" 2>/dev/null | grep '/etc/init.d/' | head -n 1
-            ;;
-        apk)
-            apk info -L "$TAILSCALE_PKG" 2>/dev/null | grep '/etc/init.d/' | head -n 1
-            ;;
+        opkg) opkg files "$TAILSCALE_PKG" 2>/dev/null | grep '/etc/init.d/' | head -n1 ;;
+        apk)  apk info -L "$TAILSCALE_PKG" 2>/dev/null | grep '/etc/init.d/' | head -n1 ;;
     esac
 }
 
-is_init_script_executable() {
-    _path="$1"
-    [ -n "$_path" ] && [ -x "$_path" ]
-}
+is_init_script_executable() { [ -n "$1" ] && [ -x "$1" ]; }
 
 reinstall_tailscale_package() {
-    log_warn "Файлы пакета $TAILSCALE_PKG повреждены или удалены — выполняем переустановку..."
-
+    log_info "Переустановка $TAILSCALE_PKG..."
     pm_update_indexes || return 1
     pm_reinstall "$TAILSCALE_PKG" || return 1
-
-    log_ok "Пакет $TAILSCALE_PKG переустановлен."
     return 0
 }
 
 resolve_tailscale_init_path() {
     if is_init_script_executable "$TAILSCALE_INIT_DEFAULT"; then
-        TAILSCALE_INIT_PATH="$TAILSCALE_INIT_DEFAULT"
-        return 0
+        TAILSCALE_INIT_PATH="$TAILSCALE_INIT_DEFAULT"; return 0
     fi
-
     _pkg_init="$(init_script_from_package_list)"
     if is_init_script_executable "$_pkg_init"; then
-        TAILSCALE_INIT_PATH="$_pkg_init"
-        return 0
+        TAILSCALE_INIT_PATH="$_pkg_init"; return 0
     fi
-
-    if ! is_tailscale_package_installed; then
-        return 1
+    if is_tailscale_package_installed; then
+        reinstall_tailscale_package || return 1
+        if is_init_script_executable "$TAILSCALE_INIT_DEFAULT"; then
+            TAILSCALE_INIT_PATH="$TAILSCALE_INIT_DEFAULT"; return 0
+        fi
+        _pkg_init="$(init_script_from_package_list)"
+        if is_init_script_executable "$_pkg_init"; then
+            TAILSCALE_INIT_PATH="$_pkg_init"; return 0
+        fi
     fi
-
-    reinstall_tailscale_package || return 1
-
-    if is_init_script_executable "$TAILSCALE_INIT_DEFAULT"; then
-        TAILSCALE_INIT_PATH="$TAILSCALE_INIT_DEFAULT"
-        return 0
-    fi
-
-    _pkg_init="$(init_script_from_package_list)"
-    if is_init_script_executable "$_pkg_init"; then
-        TAILSCALE_INIT_PATH="$_pkg_init"
-        return 0
-    fi
-
     return 1
 }
 
 ensure_init_script_exists() {
-    if resolve_tailscale_init_path; then
-        log_ok "Init-скрипт найден: $TAILSCALE_INIT_PATH"
-        return 0
-    fi
-
-    die "Init-скрипт Tailscale не найден. Выполните: $SYS_PM install --force-reinstall $TAILSCALE_PKG"
+    resolve_tailscale_init_path || die "Init-скрипт Tailscale не найден."
+    log_ok "Init-скрипт: $TAILSCALE_INIT_PATH"
 }
 
 enable_service() {
-    log_info "Включение автозапуска сервиса Tailscale..."
-    "$TAILSCALE_INIT_PATH" enable || die "Не удалось включить автозапуск сервиса Tailscale."
+    log_info "Включение автозапуска..."
+    "$TAILSCALE_INIT_PATH" enable || die "Не удалось включить автозапуск."
     log_ok "Автозапуск включён."
 }
 
 start_service() {
-    log_info "Запуск сервиса Tailscale..."
-    "$TAILSCALE_INIT_PATH" start || die "Не удалось запустить сервис Tailscale."
+    log_info "Запуск сервиса..."
+    "$TAILSCALE_INIT_PATH" start || die "Не удалось запустить сервис."
 }
 
-is_daemon_running() {
-    if have_cmd pidof; then
-        if pidof tailscaled >/dev/null 2>&1; then
-            return 0
-        fi
-        return 1
-    fi
-
-    pgrep tailscaled >/dev/null 2>&1
-}
-
-wait_for_daemon() {
+# Проверка готовности демона через tailscale status
+wait_for_daemon_ready() {
     _elapsed=0
-
-    log_info "Ожидание запуска tailscaled (до ${DAEMON_WAIT_SECS} с)..."
-
+    log_info "Ожидание готовности tailscaled (до ${DAEMON_WAIT_SECS} с)..."
     while [ "$_elapsed" -lt "$DAEMON_WAIT_SECS" ]; do
-        if is_daemon_running; then
-            log_ok "Демон tailscaled запущен."
+        if is_process_running tailscaled && tailscale status >/dev/null 2>&1; then
+            log_ok "Демон готов."
             return 0
         fi
         sleep "$DAEMON_POLL_SECS"
         _elapsed=$((_elapsed + DAEMON_POLL_SECS))
     done
-
-    log_error "Демон tailscaled не запустился за ${DAEMON_WAIT_SECS} с."
+    log_error "Демон не готов за ${DAEMON_WAIT_SECS} с."
+    # Диагностика
+    if is_process_running tailscaled; then
+        log_error "Процесс tailscaled запущен, но не отвечает. Проверьте логи: logread | grep tailscale"
+    else
+        log_error "Процесс tailscaled не найден. Проверьте логи: logread | grep tailscale"
+    fi
     return 1
 }
 
 check_daemon_status() {
-    if is_daemon_running; then
-        log_ok "Статус демона: работает."
+    if is_process_running tailscaled; then
+        log_ok "Статус: работает."
         return 0
     fi
-
-    log_error "Статус демона: не работает."
+    log_error "Статус: не работает."
     return 1
 }
 
 manage_service() {
     log_step "Управление сервисом Tailscale"
-
     ensure_init_script_exists
     enable_service
     start_service
-    wait_for_daemon || die "Tailscaled не запустился."
-    check_daemon_status || die "Проверка статуса tailscaled не пройдена."
+    wait_for_daemon_ready || die "Tailscaled не готов."
 }
 
 # =============================================================================
@@ -523,103 +493,75 @@ manage_service() {
 # =============================================================================
 
 uci_section_exists() {
-    _config="$1"
-    _section="$2"
-    uci -q get "${_config}.${_section}" >/dev/null 2>&1
+    _cfg="$1"; _sec="$2"
+    uci -q get "${_cfg}.${_sec}" >/dev/null 2>&1
 }
 
 firewall_zone_index_by_name() {
-    _zone_name="$1"
-    _idx=0
-
+    _zone="$1"; _idx=0
     while uci -q get "firewall.@zone[${_idx}]" >/dev/null 2>&1; do
         _name="$(uci -q get "firewall.@zone[${_idx}].name" 2>/dev/null || true)"
-        if [ "$_name" = "$_zone_name" ]; then
-            printf '%s' "$_idx"
-            return 0
-        fi
+        [ "$_name" = "$_zone" ] && { printf '%s' "$_idx"; return 0; }
         _idx=$((_idx + 1))
     done
-
     return 1
 }
 
-firewall_zone_exists() {
-    _zone_name="$1"
-    firewall_zone_index_by_name "$_zone_name" >/dev/null 2>&1
-}
+firewall_zone_exists() { firewall_zone_index_by_name "$1" >/dev/null 2>&1; }
 
 firewall_forwarding_exists() {
-    _src="$1"
-    _dest="$2"
-    _idx=0
-
+    _src="$1"; _dest="$2"; _idx=0
     while uci -q get "firewall.@forwarding[${_idx}]" >/dev/null 2>&1; do
         _f_src="$(uci -q get "firewall.@forwarding[${_idx}].src" 2>/dev/null || true)"
         _f_dest="$(uci -q get "firewall.@forwarding[${_idx}].dest" 2>/dev/null || true)"
-        if [ "$_f_src" = "$_src" ] && [ "$_f_dest" = "$_dest" ]; then
-            return 0
-        fi
+        [ "$_f_src" = "$_src" ] && [ "$_f_dest" = "$_dest" ] && return 0
         _idx=$((_idx + 1))
     done
-
     return 1
 }
 
 firewall_rule_exists() {
-    _rule_name="$1"
-    _idx=0
-
+    _name="$1"; _idx=0
     while uci -q get "firewall.@rule[${_idx}]" >/dev/null 2>&1; do
-        _name="$(uci -q get "firewall.@rule[${_idx}].name" 2>/dev/null || true)"
-        if [ "$_name" = "$_rule_name" ]; then
-            return 0
-        fi
+        _n="$(uci -q get "firewall.@rule[${_idx}].name" 2>/dev/null || true)"
+        [ "$_n" = "$_name" ] && return 0
         _idx=$((_idx + 1))
     done
-
     return 1
 }
 
 uci_commit_and_reload() {
     log_info "Сохранение изменений UCI..."
-    uci commit network || die "Не удалось выполнить uci commit network."
-    uci commit firewall || die "Не удалось выполнить uci commit firewall."
-
+    uci commit network || die "Ошибка uci commit network."
+    uci commit firewall || die "Ошибка uci commit firewall."
     log_info "Перезагрузка network и firewall..."
-    /etc/init.d/network reload || log_warn "Перезагрузка network завершилась с предупреждением."
+    /etc/init.d/network reload || log_warn "Перезагрузка network с предупреждением."
     /etc/init.d/firewall reload || die "Не удалось перезагрузить firewall."
 }
 
 # =============================================================================
-# UCI — сеть
+# UCI — сеть и firewall
 # =============================================================================
 
 configure_network_interface() {
     if uci_section_exists network "$NET_INTERFACE"; then
-        log_info "Сетевой интерфейс '$NET_INTERFACE' уже существует."
+        log_info "Интерфейс '$NET_INTERFACE' уже существует."
         return 0
     fi
-
-    log_info "Создание сетевого интерфейса '$NET_INTERFACE'..."
+    log_info "Создание интерфейса '$NET_INTERFACE'..."
     uci set "network.${NET_INTERFACE}=interface"
     uci set "network.${NET_INTERFACE}.device=${NET_DEVICE}"
     uci set "network.${NET_INTERFACE}.proto=unmanaged"
     uci set "network.${NET_INTERFACE}.auto=1"
-    log_ok "Интерфейс '$NET_INTERFACE' создан."
+    log_ok "Интерфейс создан."
 }
-
-# =============================================================================
-# UCI — firewall
-# =============================================================================
 
 configure_firewall_zone() {
     if firewall_zone_exists "$FW_ZONE"; then
         log_info "Firewall-зона '$FW_ZONE' уже существует."
         return 0
     fi
-
-    log_info "Создание firewall-зоны '$FW_ZONE'..."
+    log_info "Создание зоны '$FW_ZONE'..."
     uci add firewall zone
     uci set "firewall.@zone[-1].name=${FW_ZONE}"
     uci set "firewall.@zone[-1].input=ACCEPT"
@@ -628,7 +570,7 @@ configure_firewall_zone() {
     uci set "firewall.@zone[-1].masq=1"
     uci set "firewall.@zone[-1].mtu_fix=1"
     uci add_list "firewall.@zone[-1].network=${NET_INTERFACE}"
-    log_ok "Firewall-зона '$FW_ZONE' создана."
+    log_ok "Зона создана."
 }
 
 configure_firewall_forwarding() {
@@ -636,49 +578,42 @@ configure_firewall_forwarding() {
         log_info "Forwarding ${FW_ZONE} -> ${FW_WAN_ZONE} уже настроен."
         return 0
     fi
-
-    log_info "Добавление forwarding: ${FW_ZONE} -> ${FW_WAN_ZONE}..."
+    log_info "Добавление forwarding ${FW_ZONE} -> ${FW_WAN_ZONE}..."
     uci add firewall forwarding
     uci set "firewall.@forwarding[-1].src=${FW_ZONE}"
     uci set "firewall.@forwarding[-1].dest=${FW_WAN_ZONE}"
-    log_ok "Forwarding ${FW_ZONE} -> ${FW_WAN_ZONE} добавлен."
+    log_ok "Forwarding добавлен."
 }
 
 add_firewall_rule_if_missing() {
-    _name="$1"
-    _proto="$2"
-    _port="$3"
-
+    _name="$1"; _proto="$2"; _port="$3"
     if firewall_rule_exists "$_name"; then
-        log_info "Правило firewall '$_name' уже существует."
+        log_info "Правило '$_name' уже существует."
         return 0
     fi
-
-    log_info "Добавление правила firewall: $_name (порт $_port)..."
+    log_info "Добавление правила '$_name' (порт $_port)..."
     uci add firewall rule
     uci set "firewall.@rule[-1].name=${_name}"
     uci set "firewall.@rule[-1].src=${FW_ZONE}"
     uci set "firewall.@rule[-1].proto=${_proto}"
     uci set "firewall.@rule[-1].dest_port=${_port}"
     uci set "firewall.@rule[-1].target=ACCEPT"
-    log_ok "Правило '$_name' добавлено."
+    log_ok "Правило добавлено."
 }
 
 configure_firewall_rules() {
-    add_firewall_rule_if_missing "$FW_RULE_SSH" "tcp" "$PORT_SSH"
-    add_firewall_rule_if_missing "$FW_RULE_HTTP" "tcp" "$PORT_HTTP"
+    add_firewall_rule_if_missing "$FW_RULE_SSH"   "tcp" "$PORT_SSH"
+    add_firewall_rule_if_missing "$FW_RULE_HTTP"  "tcp" "$PORT_HTTP"
     add_firewall_rule_if_missing "$FW_RULE_HTTPS" "tcp" "$PORT_HTTPS"
 }
 
 configure_network() {
     log_step "Настройка сети и firewall"
-
     configure_network_interface
     configure_firewall_zone
     configure_firewall_forwarding
     configure_firewall_rules
     uci_commit_and_reload
-
     log_ok "Сеть и firewall настроены."
 }
 
@@ -687,41 +622,39 @@ configure_network() {
 # =============================================================================
 
 enable_ip_forwarding_runtime() {
-    _current="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
-    if [ "$_current" = "1" ]; then
-        log_info "IPv4 forwarding уже включён (runtime)."
-        return 0
-    fi
-
+    _cur="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)"
+    [ "$_cur" = "1" ] && { log_info "IPv4 forwarding уже включён (runtime)."; return 0; }
     log_info "Включение IPv4 forwarding (runtime)..."
-    if sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1; then
-        log_ok "IPv4 forwarding включён (runtime)."
-    else
-        log_warn "Не удалось включить IPv4 forwarding через sysctl."
-    fi
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null && log_ok "Включён." || log_warn "Не удалось."
+}
+
+# Сохраняем исходное значение forwarding в служебный файл
+save_forwarding_original() {
+    mkdir -p "$(dirname "$FORWARDING_BACKUP")" 2>/dev/null
+    _current="$(uci -q get network.globals.forwarding 2>/dev/null || echo "")"
+    echo "$_current" > "$FORWARDING_BACKUP"
+    log_info "Сохранено исходное значение forwarding: '$_current'"
 }
 
 enable_ip_forwarding_uci() {
+    # Сохраняем оригинал перед изменением
+    save_forwarding_original
+
     if uci_section_exists network globals; then
         _fwd="$(uci -q get network.globals.forwarding 2>/dev/null || echo 0)"
-        if [ "$_fwd" = "1" ]; then
-            log_info "IPv4 forwarding уже сохранён в UCI."
-            return 0
-        fi
+        [ "$_fwd" = "1" ] && { log_info "IP forwarding уже сохранён в UCI."; return 0; }
         uci set network.globals.forwarding='1'
     else
-        log_info "Создание секции network.globals для IP forwarding..."
+        log_info "Создание network.globals..."
         uci set network.globals=globals
         uci set network.globals.forwarding='1'
     fi
-
-    uci commit network || die "Не удалось сохранить IP forwarding в UCI."
-    log_ok "IPv4 forwarding сохранён в UCI."
+    uci commit network || die "Не удалось сохранить IP forwarding."
+    log_ok "IP forwarding сохранён в UCI."
 }
 
 enable_ip_forwarding() {
     log_step "Настройка IP forwarding"
-
     enable_ip_forwarding_runtime
     enable_ip_forwarding_uci
 }
@@ -730,110 +663,81 @@ enable_ip_forwarding() {
 # Tailscale — Exit Node и авторизация
 # =============================================================================
 
+is_tailscale_authenticated() {
+    tailscale ip -4 >/dev/null 2>&1 && [ -f "/var/lib/tailscale/tailscaled.state" ]
+    return $?
+}
+
 configure_exit_node() {
     log_step "Настройка Exit Node"
 
-    log_info "Выполнение: tailscale up ${TAILSCALE_UP_ARGS}"
-
-    # shellcheck disable=SC2086
-    if tailscale up $TAILSCALE_UP_ARGS; then
-        log_ok "Tailscale поднят с параметрами Exit Node."
+    # Если уже авторизован, пропускаем
+    if is_tailscale_authenticated; then
+        log_ok "Tailscale уже авторизован (IPv4: $(tailscale ip -4 2>/dev/null)). Пропускаем 'tailscale up'."
         return 0
     fi
 
-    log_warn "tailscale up завершился с ошибкой (возможно, требуется авторизация)."
+    _cmd="tailscale up"
+    if [ -n "$AUTH_KEY" ]; then
+        _cmd="$_cmd --auth-key=$AUTH_KEY"
+        log_info "Используется ключ авторизации."
+    fi
+    _cmd="$_cmd $TAILSCALE_UP_ARGS"
+
+    log_info "Выполнение: $_cmd"
+    # Запускаем с таймаутом (если нет ключа) или без таймаута (если ключ есть)
+    if [ -n "$AUTH_KEY" ]; then
+        # Без таймаута — ждём завершения
+        sh -c "$_cmd" > /tmp/tailscale_up.log 2>&1
+        _ret=$?
+        cat /tmp/tailscale_up.log
+    else
+        # С таймаутом
+        run_with_timeout "$TAILSCALE_UP_TIMEOUT" sh -c "$_cmd" > /tmp/tailscale_up.log 2>&1
+        _ret=$?
+        cat /tmp/tailscale_up.log
+        if [ $_ret -eq 124 ]; then
+            log_warn "Команда tailscale up не завершилась за ${TAILSCALE_UP_TIMEOUT} сек."
+        fi
+    fi
+
+    # Проверяем успешность
+    if is_tailscale_authenticated; then
+        log_ok "Tailscale успешно авторизован."
+        return 0
+    fi
+
+    # Если не авторизованы – извлекаем ссылку
+    _url="$(grep -o 'https://login.tailscale.com/[^ ]*' /tmp/tailscale_up.log 2>/dev/null | head -n1)"
+    if [ -n "$_url" ]; then
+        printf '\n'
+        log_info "Для завершения авторизации перейдите по ссылке:"
+        printf '    %s\n\n' "$_url"
+        log_info "После входа выполните 'tailscale up' вручную или перезапустите скрипт с ключом."
+    else
+        log_warn "Не удалось получить ссылку для входа. Попробуйте выполнить вручную:"
+        printf '    %s\n' "$_cmd"
+        # Выведем последние строки лога для диагностики
+        tail -n 5 /tmp/tailscale_up.log >&2
+    fi
+
     return 0
 }
 
-is_tailscale_authenticated() {
-    _status=""
-
-    _status="$(tailscale status 2>&1 || true)"
-
-    if printf '%s\n' "$_status" | grep -qi 'logged out'; then
-        return 1
-    fi
-
-    if printf '%s\n' "$_status" | grep -q 'https://login.tailscale.com/'; then
-        return 1
-    fi
-
-    if printf '%s\n' "$_status" | grep -qi 'needs login'; then
-        return 1
-    fi
-
-    if tailscale ip -4 >/dev/null 2>&1; then
-        return 0
-    fi
-
-    return 1
-}
-
-extract_login_url() {
-    _status=""
-    _url=""
-
-    _status="$(tailscale status 2>&1 || true)"
-    _url="$(printf '%s\n' "$_status" | grep -o 'https://login.tailscale.com/[^ ]*' | head -n 1)"
-
-    if [ -n "$_url" ]; then
-        printf '%s' "$_url"
-        return 0
-    fi
-
-    return 1
-}
-
-login_user() {
-    log_step "Проверка авторизации Tailscale"
-
-    if is_tailscale_authenticated; then
-        log_ok "Устройство уже авторизовано в Tailscale."
-        return 0
-    fi
-
-    log_warn "Устройство не авторизовано в Tailscale."
-
-    if _url="$(extract_login_url)"; then
-        printf '\n'
-        log_info "Перейдите по ссылке для авторизации:"
-        printf '    %s\n\n' "$_url"
-    else
-        printf '\n'
-        log_info "Для авторизации выполните:"
-        printf '    tailscale up %s\n\n' "$TAILSCALE_UP_ARGS"
-    fi
-
-    log_info "После входа включите Exit Node в админке Tailscale:"
-    printf '    https://login.tailscale.com/admin/machines\n\n'
-}
-
 # =============================================================================
-# Итоговая проверка
+# Финальная проверка
 # =============================================================================
 
 verify_installation() {
     _ok=0
-
-    if ! verify_tailscale_binaries; then
+    verify_tailscale_binaries || _ok=1
+    is_process_running tailscaled || { log_error "tailscaled не запущен."; _ok=1; }
+    uci_section_exists network "$NET_INTERFACE" || { log_error "Интерфейс $NET_INTERFACE не найден."; _ok=1; }
+    firewall_zone_exists "$FW_ZONE" || { log_error "Зона $FW_ZONE не найдена."; _ok=1; }
+    if ! is_tailscale_authenticated; then
+        log_error "Tailscale не авторизован или отсутствует state-файл."
         _ok=1
     fi
-
-    if ! is_daemon_running; then
-        log_error "Проверка: tailscaled не запущен."
-        _ok=1
-    fi
-
-    if ! uci_section_exists network "$NET_INTERFACE"; then
-        log_error "Проверка: интерфейс $NET_INTERFACE не найден в UCI."
-        _ok=1
-    fi
-
-    if ! firewall_zone_exists "$FW_ZONE"; then
-        log_error "Проверка: firewall-зона $FW_ZONE не найдена."
-        _ok=1
-    fi
-
     return "$_ok"
 }
 
@@ -842,11 +746,7 @@ verify_installation() {
 # =============================================================================
 
 print_banner() {
-    printf '\n'
-    printf '=========================================\n'
-    printf '%s\n' "$SCRIPT_TITLE"
-    printf '=========================================\n'
-    printf '\n'
+    printf '\n=========================================\n%s\n=========================================\n\n' "$SCRIPT_TITLE"
 }
 
 print_system_summary() {
@@ -858,34 +758,18 @@ print_system_summary() {
 }
 
 print_final_report() {
-    _auth_state="не авторизовано"
-    _daemon_state="остановлен"
-    _ts_ip=""
-
-    if is_tailscale_authenticated; then
-        _auth_state="авторизовано"
-    fi
-
-    if is_daemon_running; then
-        _daemon_state="работает"
-    fi
-
+    _auth="не авторизовано"
+    is_tailscale_authenticated && _auth="авторизовано"
+    _state="остановлен"
+    is_process_running tailscaled && _state="работает"
     _ts_ip="$(tailscale ip -4 2>/dev/null || true)"
 
-    printf '\n'
-    printf '=========================================\n'
-    printf ' Установка Tailscale завершена\n'
-    printf '=========================================\n'
-    printf '\n'
+    printf '\n=========================================\n Установка Tailscale завершена\n=========================================\n\n'
     log_ok "Пакет          : установлен"
-    log_ok "Сервис         : ${_daemon_state}"
-    log_ok "Авторизация    : ${_auth_state}"
+    log_ok "Сервис         : ${_state}"
+    log_ok "Авторизация    : ${_auth}"
     log_ok "Exit Node      : настроен (${TAILSCALE_UP_ARGS})"
-
-    if [ -n "$_ts_ip" ]; then
-        log_info "Tailscale IPv4 : ${_ts_ip}"
-    fi
-
+    [ -n "$_ts_ip" ] && log_info "Tailscale IPv4 : ${_ts_ip}"
     printf '\n'
     log_info "Проверка статуса : tailscale status"
     log_info "Админка Tailscale: https://login.tailscale.com/admin/machines"
@@ -897,25 +781,47 @@ print_final_report() {
 # =============================================================================
 
 main() {
-    require_root
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --mirror)
+                [ -n "$2" ] || die "Ошибка: --mirror требует URL."
+                MIRROR_URL="$2"
+                shift 2
+                ;;
+            --auth-key)
+                [ -n "$2" ] || die "Ошибка: --auth-key требует ключ."
+                AUTH_KEY="$2"
+                shift 2
+                ;;
+            *) die "Неизвестный аргумент: $1" ;;
+        esac
+    done
 
+    require_root
     detect_system
+
+    trap restore_mirror EXIT
+
+    if [ -n "$MIRROR_URL" ]; then
+        setup_mirror || die "Не удалось настроить зеркало."
+    fi
+
     print_banner
     print_system_summary
     validate_environment
 
     install_dependencies
+    configure_timezone
     ensure_tailscale_installed
     manage_service
     configure_network
     enable_ip_forwarding
     configure_exit_node
-    login_user
 
     if verify_installation; then
         print_final_report
     else
-        log_warn "Установка завершена с предупреждениями — проверьте сообщения выше."
+        log_warn "Установка завершена с предупреждениями."
         print_final_report
         exit 1
     fi
